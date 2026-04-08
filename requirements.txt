@@ -1,1 +1,2 @@
 pyTelegramBotAPI
+pip install python-telegram-bot
