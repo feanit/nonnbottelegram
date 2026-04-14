@@ -9,7 +9,7 @@ from typing import Optional, Dict, List, Tuple
 
 # Проверка версии Python
 if sys.version_info >= (3, 12):
-    print("⚠️ Внимание: Вы используете Python 3.14. Если возникнут проблемы, установите Python 3.11")
+    print("⚠️ Внимание: Вы используете Python 3.12+. Если возникнут проблемы, установите Python 3.11")
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -51,6 +51,9 @@ COOLDOWN_BASE = {
     "transfer": 2,
     "resume": 30,
 }
+
+# Глобальный КД между отправкой заявок (минут)
+REQUEST_COOLDOWN_MINUTES = 2
 
 # Привилегии в точном формате
 PRIVILEGES = {
@@ -168,6 +171,8 @@ def save_data():
                 "last_custom_text_date"].isoformat()
         if "last_nickname_change_date" in data["users"][str(uid)] and data["users"][str(uid)]["last_nickname_change_date"]:
             data["users"][str(uid)]["last_nickname_change_date"] = data["users"][str(uid)]["last_nickname_change_date"].isoformat()
+        if "last_request_time" in data["users"][str(uid)] and data["users"][str(uid)]["last_request_time"]:
+            data["users"][str(uid)]["last_request_time"] = data["users"][str(uid)]["last_request_time"].isoformat()
 
     for uid, ban_data in banned_users.items():
         data["banned_users"][str(uid)] = ban_data.copy()
@@ -234,6 +239,8 @@ def load_data():
                 user_data["last_custom_text_date"] = datetime.fromisoformat(user_data["last_custom_text_date"])
             if "last_nickname_change_date" in user_data and user_data["last_nickname_change_date"]:
                 user_data["last_nickname_change_date"] = datetime.fromisoformat(user_data["last_nickname_change_date"])
+            if "last_request_time" in user_data and user_data["last_request_time"]:
+                user_data["last_request_time"] = datetime.fromisoformat(user_data["last_request_time"])
             users[uid] = user_data
 
         banned_users.clear()
@@ -288,7 +295,10 @@ def load_data():
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def is_private_chat(update: Update) -> bool:
-    """Проверяет, является ли чат личным."""
+    """Проверяет, является ли чат личным (с учётом возможного None)."""
+    if update.effective_chat is None:
+        logger.warning("effective_chat is None в is_private_chat")
+        return False
     return update.effective_chat.type == 'private'
 
 
@@ -347,6 +357,20 @@ def check_nickname_change_cooldown(uid: int) -> Tuple[bool, Optional[str]]:
         days = remaining.days
         hours = remaining.seconds // 3600
         return False, f"⏳ {days}д {hours}ч"
+    return True, None
+
+
+def check_request_cooldown(uid: int) -> Tuple[bool, Optional[str]]:
+    """Проверяет, можно ли отправить новую заявку (глобальный 2-минутный КД)."""
+    if uid not in users or "last_request_time" not in users[uid] or not users[uid]["last_request_time"]:
+        return True, None
+    last = users[uid]["last_request_time"]
+    delta = timedelta(minutes=REQUEST_COOLDOWN_MINUTES)
+    if datetime.now() - last < delta:
+        remaining = delta - (datetime.now() - last)
+        minutes = remaining.seconds // 60
+        seconds = remaining.seconds % 60
+        return False, f"⏳ {minutes}м {seconds}с"
     return True, None
 
 
@@ -684,6 +708,8 @@ async def reset_cds(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users[target_id]["retire_date"] = None
         if "last_nickname_change_date" in users[target_id]:
             del users[target_id]["last_nickname_change_date"]
+        if "last_request_time" in users[target_id]:
+            del users[target_id]["last_request_time"]
 
     save_data()
     await update.message.reply_text(f"✅ Все КД сброшены для игрока с ID {target_id}")
@@ -1071,58 +1097,71 @@ async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ОБРАБОТЧИКИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Этот бот работает только в личных сообщениях. Пожалуйста, используйте /start в ЛС с ботом.")
-        return ConversationHandler.END
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Этот бот работает только в личных сообщениях. Пожалуйста, используйте /start в ЛС с ботом.")
+            return ConversationHandler.END
 
-    uid = update.effective_user.id
-    if uid in users:
-        update_username(uid, update.effective_user.username or "no_username")
+        uid = update.effective_user.id
+        if uid in users:
+            update_username(uid, update.effective_user.username or "no_username")
 
-    if is_banned(uid):
-        await update.message.reply_text("🚫 Вы забанены")
+        if is_banned(uid):
+            await update.message.reply_text("🚫 Вы забанены")
+            return ConversationHandler.END
+        if uid in users:
+            nickname = users[uid]['nickname']
+            await update.message.reply_text(f"👋 С возвращением {nickname}, выберите что вас интересует!", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+        await update.message.reply_text(
+            f"👋 Введи ник (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа):")
+        return REGISTER_NICKNAME
+    except Exception as e:
+        logger.error(f"Ошибка в start для пользователя {update.effective_user.id if update.effective_user else 'unknown'}: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
         return ConversationHandler.END
-    if uid in users:
-        await update.message.reply_text("С возвращением!", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-    await update.message.reply_text(
-        f"👋 Введи ник (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа):")
-    return REGISTER_NICKNAME
 
 
 async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Эта команда доступна только в личных сообщениях.")
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Эта команда доступна только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        nickname = update.message.text.strip()
+
+        is_valid, error_message = is_valid_nickname(nickname)
+        if not is_valid:
+            await update.message.reply_text(f"{error_message}\nПопробуй еще раз:")
+            return REGISTER_NICKNAME
+
+        if is_nickname_taken(nickname):
+            await update.message.reply_text("❌ Этот ник уже занят другим игроком\nПопробуй другой ник:")
+            return REGISTER_NICKNAME
+
+        username = update.effective_user.username or "no_username"
+        users[uid] = {
+            "nickname": nickname,
+            "username": username,
+            "free_agent": True,
+            "club": None,
+            "retired": False,
+            "retire_date": None,
+            "last_free_agent_date": None,
+            "last_custom_text_date": None,
+            "privilege": "player",
+            "reg_date": datetime.now(),
+            "last_nickname_change_date": None,
+            "last_request_time": None
+        }
+        save_data()
+        await update.message.reply_text(f"✅ Регистрация завершена, {nickname}!", reply_markup=get_main_keyboard(uid))
         return ConversationHandler.END
-
-    uid = update.effective_user.id
-    nickname = update.message.text.strip()
-
-    is_valid, error_message = is_valid_nickname(nickname)
-    if not is_valid:
-        await update.message.reply_text(f"{error_message}\nПопробуй еще раз:")
-        return REGISTER_NICKNAME
-
-    if is_nickname_taken(nickname):
-        await update.message.reply_text("❌ Этот ник уже занят другим игроком\nПопробуй другой ник:")
-        return REGISTER_NICKNAME
-
-    users[uid] = {
-        "nickname": nickname,
-        "username": update.effective_user.username or "no_username",
-        "free_agent": True,
-        "club": None,
-        "retired": False,
-        "retire_date": None,
-        "last_free_agent_date": None,
-        "last_custom_text_date": None,
-        "privilege": "player",
-        "reg_date": datetime.now(),
-        "last_nickname_change_date": None
-    }
-    save_data()
-    await update.message.reply_text(f"✅ Регистрация завершена, {nickname}!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в register_nickname: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Ошибка при регистрации. Попробуйте /start заново.")
+        return ConversationHandler.END
 
 
 async def set_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1170,131 +1209,844 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     data = q.data
-
-    # Сначала обрабатываем действия, которые должны работать в любом чате (например, в группе модерации)
-    if data.startswith("approve_"):
-        await moderation_approve(update, context)
-        return ConversationHandler.END
-    if data.startswith("reject_"):
-        post_id = int(data.split("_")[1])
-        context.user_data["reject_post_id"] = post_id
-        await q.edit_message_text("📝 Напиши причину отклонения заявки:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_REJECT_REASON
-
-    # Теперь проверяем, что остальные действия выполняются только в личных сообщениях
-    if not is_private_chat(update):
-        await q.edit_message_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    if uid in users:
-        update_username(uid, q.from_user.username or "no_username")
-
-    if uid not in users:
-        await q.edit_message_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    if is_banned(uid) and data != "profile":
-        await q.edit_message_text("🚫 Вы забанены")
-        return ConversationHandler.END
-
-    if users[uid].get("retired") and data not in ["profile", "resume", "back_to_main"]:
-        await q.edit_message_text(
-            "❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    if data == "free_agent":
-        ok, msg = check_free_agent_cooldown(uid)
-        if not ok:
-            await q.edit_message_text(f"❌ Нельзя отправить заявку так часто!\n{msg}",
-                                      reply_markup=get_main_keyboard(uid))
+    try:
+        # Сначала обрабатываем действия, которые должны работать в любом чате (например, в группе модерации)
+        if data.startswith("approve_"):
+            await moderation_approve(update, context)
             return ConversationHandler.END
-        await q.edit_message_text("📝 Напиши комментарий:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_FREE_AGENT_COMMENT
-    elif data == "custom_text":
-        ok, msg = check_custom_text_cooldown(uid)
-        if not ok:
-            await q.edit_message_text(f"❌ Нельзя отправить заявку так часто!\n{msg}",
-                                      reply_markup=get_main_keyboard(uid))
+        if data.startswith("reject_"):
+            post_id = int(data.split("_")[1])
+            context.user_data["reject_post_id"] = post_id
+            await q.edit_message_text("📝 Напиши причину отклонения заявки:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_REJECT_REASON
+
+        # Теперь проверяем, что остальные действия выполняются только в личных сообщениях
+        if not is_private_chat(update):
+            await q.edit_message_text("🤖 Это действие доступно только в личных сообщениях.")
             return ConversationHandler.END
-        await q.edit_message_text("📝 Напиши свой текст:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_CUSTOM_TEXT
-    elif data == "profile":
-        await q.edit_message_text(format_profile(users[uid], uid), parse_mode='MarkdownV2',
-                                  reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-    elif data == "change_nickname":
-        if users[uid].get("retired"):
-            await q.edit_message_text("❌ Вы завершили карьеру. Смена ника недоступна.",
-                                      reply_markup=get_main_keyboard(uid))
+
+        if uid in users:
+            update_username(uid, q.from_user.username or "no_username")
+
+        if uid not in users:
+            await q.edit_message_text("❌ Зарегистрируйся через /start")
             return ConversationHandler.END
-        ok, msg = check_nickname_change_cooldown(uid)
-        if not ok:
-            await q.edit_message_text(f"❌ Сменить ник можно раз в {NICKNAME_CHANGE_COOLDOWN_DAYS} дней.\n{msg}",
-                                      reply_markup=get_main_keyboard(uid))
+
+        if is_banned(uid) and data != "profile":
+            await q.edit_message_text("🚫 Вы забанены")
             return ConversationHandler.END
-        await q.edit_message_text(
-            f"✏️ Введи новый ник (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_NEW_NICKNAME
-    elif data == "retire":
-        if users[uid].get("retired"):
-            await q.edit_message_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
-            return ConversationHandler.END
-        await q.edit_message_text("📝 Напиши комментарий к завершению карьеры:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_RETIRE_COMMENT
-    elif data == "resume":
-        if not users[uid].get("retired"):
-            await q.edit_message_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
-            return ConversationHandler.END
-        ok, msg = check_resume_cooldown(uid)
-        if not ok:
-            await q.edit_message_text(f"❌ {msg}", reply_markup=get_main_keyboard(uid))
-            return ConversationHandler.END
-        await q.edit_message_text("📝 Напиши комментарий к возвращению:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_RESUME_COMMENT
-    elif data == "transfer" and uid in TEAM_OWNERS:
-        club = TEAM_OWNERS[uid]
-        if clubs_data[club]["status"] == "closed":
+
+        if users[uid].get("retired") and data not in ["profile", "resume", "back_to_main"]:
             await q.edit_message_text(
+                "❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return ConversationHandler.END
+
+        if data == "free_agent":
+            # Глобальный КД
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            # Специфичный КД (проверка, но не установка)
+            ok, msg = check_free_agent_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ {msg}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши комментарий:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_FREE_AGENT_COMMENT
+
+        elif data == "custom_text":
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_custom_text_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ {msg}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши свой текст:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_CUSTOM_TEXT
+
+        elif data == "profile":
+            await q.edit_message_text(format_profile(users[uid], uid), parse_mode='MarkdownV2',
+                                      reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "change_nickname":
+            if users[uid].get("retired"):
+                await q.edit_message_text("❌ Вы завершили карьеру. Смена ника недоступна.",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_nickname_change_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ Сменить ник можно раз в {NICKNAME_CHANGE_COOLDOWN_DAYS} дней.\n{msg}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text(
+                f"✏️ Введи новый ник (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_NEW_NICKNAME
+
+        elif data == "retire":
+            if users[uid].get("retired"):
+                await q.edit_message_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши комментарий к завершению карьеры:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_RETIRE_COMMENT
+
+        elif data == "resume":
+            if not users[uid].get("retired"):
+                await q.edit_message_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_resume_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ {msg}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши комментарий к возвращению:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_RESUME_COMMENT
+
+        elif data == "transfer" and uid in TEAM_OWNERS:
+            club = TEAM_OWNERS[uid]
+            if clubs_data[club]["status"] == "closed":
+                await q.edit_message_text(
+                    "❌ Ваш клуб закрыт. Трансферы недоступны.",
+                    reply_markup=get_main_keyboard(uid)
+                )
+                return ConversationHandler.END
+
+            if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
+                await q.edit_message_text(
+                    f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
+                    f"Чтобы пригласить нового игрока, нужно кого-то удалить.",
+                    reply_markup=get_main_keyboard(uid)
+                )
+                return ConversationHandler.END
+
+            await q.edit_message_text(
+                f"🔄 Введи ник игрока (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа), которому хочешь предложить трансфер в {club}:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            context.user_data["transfer_club"] = club
+            return WAITING_FOR_TRANSFER_NICKNAME
+
+        elif data.startswith("accept_transfer_"):
+            transfer_id = int(data.split("_")[2])
+            if transfer_id not in pending_transfers:
+                await q.edit_message_text("❌ Этот запрос уже обработан")
+                return ConversationHandler.END
+
+            transfer = pending_transfers[transfer_id]
+            if transfer["target_id"] != uid:
+                await q.edit_message_text("❌ Это не ваш запрос")
+                return ConversationHandler.END
+
+            if clubs_data[transfer['owner_club']]["status"] == "closed":
+                await q.edit_message_text(
+                    "❌ Клуб закрыт. Трансфер невозможен.",
+                    reply_markup=get_main_keyboard(uid)
+                )
+                try:
+                    await context.bot.send_message(
+                        transfer["owner_id"],
+                        f"❌ Игрок {users[uid]['nickname']} не может принять трансфер, так как клуб закрыт."
+                    )
+                except:
+                    pass
+                del pending_transfers[transfer_id]
+                save_data()
+                return ConversationHandler.END
+
+            if len(clubs_data[transfer['owner_club']]["players"]) >= MAX_CLUB_MEMBERS:
+                await q.edit_message_text(
+                    f"❌ В клубе {transfer['owner_club']} уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
+                    f"Трансфер невозможен.",
+                    reply_markup=get_main_keyboard(uid)
+                )
+                try:
+                    await context.bot.send_message(
+                        transfer["owner_id"],
+                        f"❌ Игрок {users[uid]['nickname']} не может принять трансфер, так как в клубе {transfer['owner_club']} нет мест."
+                    )
+                except:
+                    pass
+                del pending_transfers[transfer_id]
+                save_data()
+                return ConversationHandler.END
+
+            context.user_data["transfer_id"] = transfer_id
+            await q.edit_message_text("📝 Напиши комментарий к трансферу (почему хочешь перейти):",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_TRANSFER_COMMENT
+
+        elif data.startswith("decline_transfer_"):
+            transfer_id = int(data.split("_")[2])
+            if transfer_id not in pending_transfers:
+                await q.edit_message_text("❌ Этот запрос уже обработан")
+                return ConversationHandler.END
+
+            transfer = pending_transfers[transfer_id]
+            if transfer["target_id"] != uid:
+                await q.edit_message_text("❌ Это не ваш запрос")
+                return ConversationHandler.END
+
+            try:
+                await context.bot.send_message(
+                    transfer["owner_id"],
+                    f"❌ Игрок {users[uid]['nickname']} отклонил предложение о трансфере в {transfer['owner_club']}."
+                )
+            except:
+                pass
+
+            del pending_transfers[transfer_id]
+            save_data()
+            await q.edit_message_text("❌ Ты отклонил предложение о трансфере", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "manage_club" and uid in TEAM_OWNERS:
+            club = TEAM_OWNERS[uid]
+            club_status = clubs_data[club].get("status", "active")
+            await q.edit_message_text(
+                f"🏢 Управление клубом {club}",
+                reply_markup=get_manage_club_keyboard(club, club_status)
+            )
+            return ConversationHandler.END
+
+        elif data.startswith("close_club_"):
+            club = data.replace("close_club_", "")
+            if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
+                await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
+                return ConversationHandler.END
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Да, закрыть", callback_data=f"confirm_close_club_{club}"),
+                    InlineKeyboardButton("❌ Нет, отмена", callback_data="manage_club")
+                ]
+            ]
+            await q.edit_message_text(
+                f"⚠️ Вы уверены, что хотите **закрыть клуб {club}**?\n\n"
+                f"После закрытия:\n"
+                f"• Вы потеряете права владельца клуба\n"
+                f"• Все игроки клуба станут свободными агентами\n"
+                f"• Кнопки трансфера исчезнут\n"
+                f"• Только модератор сможет назначить нового владельца",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return ConversationHandler.END
+
+        elif data.startswith("confirm_close_club_"):
+            club = data.replace("confirm_close_club_", "")
+            if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
+                await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
+                return ConversationHandler.END
+
+            players_in_club = clubs_data[club]["players"].copy()
+
+            for pid in players_in_club:
+                if pid in users:
+                    users[pid]["club"] = None
+                    users[pid]["free_agent"] = True
+
+            clubs_data[club]["status"] = "closed"
+            clubs_data[club]["closed_date"] = datetime.now()
+            clubs_data[club]["players"] = []
+
+            if uid in TEAM_OWNERS:
+                del TEAM_OWNERS[uid]
+
+            clubs_data[club]["owner_id"] = None
+            save_data()
+
+            await q.edit_message_text(
+                f"🔴 Клуб {club} успешно закрыт!\n\n"
+                f"Вы больше не являетесь владельцем клуба.\n"
+                f"Все игроки ({len(players_in_club)}) стали свободными агентами.\n"
+                f"Кнопки управления клубом и трансферов будут скрыты.",
+                reply_markup=get_main_keyboard(uid)
+            )
+
+            # Уведомление модераторов
+            try:
+                await context.bot.send_message(
+                    MODERATION_CHAT_ID,
+                    f"🔔 Клуб **{club}** закрыт владельцем @{users[uid]['username']}\n"
+                    f"Освобождено игроков: {len(players_in_club)}"
+                )
+            except:
+                pass
+
+            for pid in players_in_club:
+                try:
+                    await context.bot.send_message(
+                        pid,
+                        f"🔴 Клуб **{club}**, в котором вы состояли, был закрыт владельцем.\n"
+                        f"Теперь вы свободный агент.",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+
+            return ConversationHandler.END
+
+        elif data.startswith("club_players_"):
+            club = data.replace("club_players_", "")
+            players = []
+            for pid in clubs_data[club]["players"]:
+                if pid in users:
+                    players.append((pid, users[pid]))
+            if not players:
+                await q.edit_message_text("❌ В клубе нет игроков",
+                                          reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+                return ConversationHandler.END
+
+            members_count = len(players)
+            members_info = f"({members_count}/{MAX_CLUB_MEMBERS})"
+
+            kb = []
+            for pid, ud in players[:10]:
+                cd_info = ""
+                if pid in clubs_data[club]["transfer_cooldowns"]:
+                    cd_date = clubs_data[club]["transfer_cooldowns"][pid]
+                    if datetime.now() - cd_date < get_cooldown_delta(pid, "transfer"):
+                        remaining = get_cooldown_delta(pid, "transfer") - (datetime.now() - cd_date)
+                        cd_info = f" ⏳{remaining.seconds // 3600}ч"
+                privilege_emoji = get_user_privilege_emoji(ud)
+                kb.append([InlineKeyboardButton(f"❌ {privilege_emoji} {ud['nickname'][:15]}{cd_info}",
+                                                callback_data=f"kick_player_{pid}_{club}")])
+            kb.append([InlineKeyboardButton("🔙 Назад", callback_data="manage_club")])
+            await q.edit_message_text(f"👥 Выбери игрока для удаления {members_info}:",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+        elif data.startswith("kick_player_"):
+            parts = data.split("_")
+            pid = int(parts[2])
+            club = "_".join(parts[3:])
+            if pid in clubs_data[club]["players"]:
+                clubs_data[club]["players"].remove(pid)
+                users[pid]["club"] = None
+                users[pid]["free_agent"] = True
+                save_data()
+                await q.edit_message_text(f"✅ Игрок {users[pid]['nickname']} удален из клуба",
+                                          reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+            return ConversationHandler.END
+
+        elif data.startswith("club_profile_"):
+            club = data.replace("club_profile_", "")
+            await q.edit_message_text(await format_club_profile(club, clubs_data[club]), parse_mode='Markdown',
+                                      reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+            return ConversationHandler.END
+
+        elif data == "moderator_panel" and uid in MODERATORS:
+            await q.edit_message_text("🛠 Панель модератора:", reply_markup=get_moderator_keyboard())
+            return ConversationHandler.END
+
+        elif data == "mod_ban" and uid in MODERATORS:
+            await q.edit_message_text("🚫 Введи @username и причину через пробел:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_BAN_REASON
+
+        elif data == "mod_unban" and uid in MODERATORS:
+            if not banned_users:
+                await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
+                return ConversationHandler.END
+            kb = []
+            for bid in list(banned_users.keys())[:10]:
+                if bid in users:
+                    privilege_emoji = get_user_privilege_emoji(users[bid])
+                    kb.append([InlineKeyboardButton(f"✅ {privilege_emoji} {users[bid]['nickname']}",
+                                                    callback_data=f"unban_{bid}")])
+            kb.append([InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")])
+            await q.edit_message_text("Выбери пользователя для разбана:", reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+        elif data.startswith("unban_") and uid in MODERATORS:
+            bid = int(data.split("_")[1])
+            if bid in banned_users:
+                del banned_users[bid]
+                save_data()
+                await q.edit_message_text("✅ Пользователь разбанен", reply_markup=get_moderator_keyboard())
+            return ConversationHandler.END
+
+        elif data == "mod_ban_list" and uid in MODERATORS:
+            if not banned_users:
+                await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
+                return ConversationHandler.END
+            text = "📋 Список забаненных:\n"
+            for bid, bd in banned_users.items():
+                if bid in users:
+                    privilege_emoji = get_user_privilege_emoji(users[bid])
+                    text += f"\n• {privilege_emoji} {users[bid]['nickname']}: {bd['reason']} ({bd['date'].strftime('%d.%m.%Y')})"
+            await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")]]))
+            return ConversationHandler.END
+
+        elif data == "mod_reset_cd" and uid in MODERATORS:
+            await q.edit_message_text("🔄 Введи @username для сброса КД:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_RESET_CD_USER
+
+        elif data == "mod_force_retire" and uid in MODERATORS:
+            await q.edit_message_text("⚡ Введи @username для сброса КД на возвращение карьеры:",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_RETIRE_COMMENT
+
+        elif data == "mod_give_privilege" and uid in MODERATORS:
+            await q.edit_message_text("👑 Введи @username и привилегию (player/vip/owner) через пробел:",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_PRIVILEGE_USER
+
+        elif data == "back_to_main":
+            await q.edit_message_text("Главное меню:", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "ignore":
+            return ConversationHandler.END
+
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в button_handler: {e}", exc_info=True)
+        await q.edit_message_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+# ==================== ТЕКСТ ====================
+async def handle_free_agent_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        # Глобальный КД (повторная проверка на случай обхода через старый callback)
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        comment = escape_html(update.message.text)
+        privilege = format_privilege_for_post(users[uid])
+        post = f"<b>📢 Свободный агент:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Ищет клуб.\nКомментарий: {comment}"
+        post = truncate_text(post)
+
+        # Устанавливаем глобальный КД (специфичный будет установлен при одобрении)
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "free_agent", uid)
+        await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_free_agent_comment: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        text = escape_html(update.message.text)
+        privilege = format_privilege_for_post(users[uid])
+        post = f"<b>📝 Свой текст:</b>\n\n{privilege} <b>{users[uid]['nickname']}</b>\n{text}"
+        post = truncate_text(post)
+
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "custom", uid)
+        await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_custom_text: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_new_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Вы завершили карьеру. Смена ника недоступна.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        new_nickname = update.message.text.strip()
+
+        is_valid, error_message = is_valid_nickname(new_nickname)
+        if not is_valid:
+            await update.message.reply_text(f"{error_message}\nПопробуй еще раз:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_NEW_NICKNAME
+
+        if is_nickname_taken(new_nickname, uid):
+            await update.message.reply_text("❌ Этот ник уже занят другим игроком\nПопробуй другой ник:",
+                                            reply_markup=InlineKeyboardMarkup(
+                                                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_NEW_NICKNAME
+
+        old_nickname = users[uid]['nickname']
+        privilege = format_privilege_for_post(users[uid])
+        post = f"<b>❗️ Смена никнейма в тм:</b>\n\n🔘 {privilege} @{users[uid]['username']} — <b>{old_nickname}</b> ➡️ <b>{new_nickname}</b>"
+        post = truncate_text(post)
+
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "nickname_change", uid,
+                                 {"new_nickname": new_nickname, "old_nickname": old_nickname})
+
+        await update.message.reply_text("✅ Заявка на смену никнейма отправлена на модерацию!",
+                                        reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_new_nickname: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_retire_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+
+        if uid in users:
+            update_username(uid, update.effective_user.username or "no_username")
+
+        if uid in MODERATORS and context.user_data.get("force_retire"):
+            username = update.message.text.strip().replace('@', '')
+            target_id = None
+            for uid2, user_data in users.items():
+                if user_data['username'] == username:
+                    target_id = uid2
+                    break
+            if target_id:
+                users[target_id]["retire_date"] = None
+                save_data()
+                await update.message.reply_text(f"✅ КД на возвращение карьеры сброшен для @{username}",
+                                                reply_markup=get_moderator_keyboard())
+            else:
+                await update.message.reply_text("❌ Игрок не найден", reply_markup=get_moderator_keyboard())
+            context.user_data["force_retire"] = False
+            return ConversationHandler.END
+
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        comment = escape_html(update.message.text)
+        privilege = format_privilege_for_post(users[uid])
+        post = f"<b>🥀 Завершение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Завершает.\nКомментарий: {comment}"
+        post = truncate_text(post)
+
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "retire", uid)
+        await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_retire_comment: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_resume_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        if not users[uid].get("retired"):
+            await update.message.reply_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        comment = escape_html(update.message.text)
+        privilege = format_privilege_for_post(users[uid])
+        post = f"<b>🌹 Возвращение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Возвращается.\nКомментарий: {comment}"
+        post = truncate_text(post)
+
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "resume", uid)
+        await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_resume_comment: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_transfer_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        if uid not in TEAM_OWNERS:
+            await update.message.reply_text("❌ У вас нет прав владельца клуба")
+            return ConversationHandler.END
+
+        nickname = update.message.text.strip()
+        club = context.user_data.get("transfer_club")
+
+        if not club:
+            await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        if clubs_data[club]["status"] == "closed":
+            await update.message.reply_text(
                 "❌ Ваш клуб закрыт. Трансферы недоступны.",
                 reply_markup=get_main_keyboard(uid)
             )
             return ConversationHandler.END
 
         if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
-            await q.edit_message_text(
+            await update.message.reply_text(
                 f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
                 f"Чтобы пригласить нового игрока, нужно кого-то удалить.",
                 reply_markup=get_main_keyboard(uid)
             )
             return ConversationHandler.END
 
-        await q.edit_message_text(
-            f"🔄 Введи ник игрока (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа), которому хочешь предложить трансфер в {club}:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
-        )
-        context.user_data["transfer_club"] = club
-        return WAITING_FOR_TRANSFER_NICKNAME
-    elif data.startswith("accept_transfer_"):
-        transfer_id = int(data.split("_")[2])
-        if transfer_id not in pending_transfers:
-            await q.edit_message_text("❌ Этот запрос уже обработан")
+        is_valid, error_message = is_valid_nickname(nickname)
+        if not is_valid:
+            await update.message.reply_text(
+                f"{error_message}\nПопробуй еще раз:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            return WAITING_FOR_TRANSFER_NICKNAME
+
+        target_id = find_user_by_nickname(nickname)
+
+        if not target_id:
+            await update.message.reply_text(
+                f"❌ Игрок с ником '{nickname}' не найден\nПроверь правильность написания или попробуй другой ник:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            return WAITING_FOR_TRANSFER_NICKNAME
+
+        if is_banned(target_id):
+            await update.message.reply_text(
+                "❌ Этот игрок забанен и не может участвовать в трансферах",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return ConversationHandler.END
+
+        if users[target_id].get("retired"):
+            await update.message.reply_text(
+                f"❌ Игрок {users[target_id]['nickname']} завершил карьеру и не может участвовать в трансферах",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return ConversationHandler.END
+
+        if target_id in clubs_data[club]["players"]:
+            await update.message.reply_text(
+                f"❌ Игрок {users[target_id]['nickname']} уже в вашем клубе",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return ConversationHandler.END
+
+        if not users[target_id].get("free_agent"):
+            current_club = users[target_id].get("club")
+            if current_club:
+                await update.message.reply_text(
+                    f"❌ Игрок {users[target_id]['nickname']} уже в клубе {current_club}.\n"
+                    f"Предложение о трансфере можно отправить только свободному агенту.",
+                    reply_markup=get_main_keyboard(uid)
+                )
+                return ConversationHandler.END
+
+        ok, msg = check_cooldown(target_id, club)
+        if not ok:
+            await update.message.reply_text(
+                f"❌ У игрока ещё КД {msg}",
+                reply_markup=get_main_keyboard(uid)
+            )
+            return ConversationHandler.END
+
+        transfer_id = len(pending_transfers) + 1
+        pending_transfers[transfer_id] = {
+            "owner_id": uid,
+            "owner_club": club,
+            "target_id": target_id,
+            "status": "pending"
+        }
+        save_data()
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Принять", callback_data=f"accept_transfer_{transfer_id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_transfer_{transfer_id}")
+            ]
+        ]
+
+        try:
+            await context.bot.send_message(
+                target_id,
+                f"📢 Вам предложили трансфер в клуб {club}!\n\n"
+                f"От: {users[uid]['nickname']}\n"
+                f"Клуб: {club}\n\n"
+                f"Хотите присоединиться?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            await update.message.reply_text(
+                f"✅ Запрос на трансфер отправлен игроку {users[target_id]['nickname']}. Ожидайте ответа.",
+                reply_markup=get_main_keyboard(uid)
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Не удалось отправить запрос игроку: {e}",
+                reply_markup=get_main_keyboard(uid)
+            )
+
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_transfer_nickname: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+async def handle_transfer_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+
+        if uid in users:
+            update_username(uid, update.effective_user.username or "no_username")
+
+        if users[uid].get("retired"):
+            await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        transfer_id = context.user_data.get("transfer_id")
+        if not transfer_id or transfer_id not in pending_transfers:
+            await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
             return ConversationHandler.END
 
         transfer = pending_transfers[transfer_id]
         if transfer["target_id"] != uid:
-            await q.edit_message_text("❌ Это не ваш запрос")
+            await update.message.reply_text("❌ Это не ваш запрос", reply_markup=get_main_keyboard(uid))
             return ConversationHandler.END
 
         if clubs_data[transfer['owner_club']]["status"] == "closed":
-            await q.edit_message_text(
+            await update.message.reply_text(
                 "❌ Клуб закрыт. Трансфер невозможен.",
                 reply_markup=get_main_keyboard(uid)
             )
@@ -1310,7 +2062,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         if len(clubs_data[transfer['owner_club']]["players"]) >= MAX_CLUB_MEMBERS:
-            await q.edit_message_text(
+            await update.message.reply_text(
                 f"❌ В клубе {transfer['owner_club']} уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
                 f"Трансфер невозможен.",
                 reply_markup=get_main_keyboard(uid)
@@ -1326,617 +2078,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_data()
             return ConversationHandler.END
 
-        context.user_data["transfer_id"] = transfer_id
-        await q.edit_message_text("📝 Напиши комментарий к трансферу (почему хочешь перейти):",
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_TRANSFER_COMMENT
-    elif data.startswith("decline_transfer_"):
-        transfer_id = int(data.split("_")[2])
-        if transfer_id not in pending_transfers:
-            await q.edit_message_text("❌ Этот запрос уже обработан")
+        ok_req, msg_req = check_request_cooldown(uid)
+        if not ok_req:
+            await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
             return ConversationHandler.END
 
-        transfer = pending_transfers[transfer_id]
-        if transfer["target_id"] != uid:
-            await q.edit_message_text("❌ Это не ваш запрос")
-            return ConversationHandler.END
+        comment = escape_html(update.message.text)
+        privilege = format_privilege_for_post(users[uid])
+
+        post = f"<b>📢 Трансфер в клуб:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) ➡️ {transfer['owner_club']}\nКомментарий: {comment}"
+        post = truncate_text(post)
+
+        users[uid]["last_request_time"] = datetime.now()
+        save_data()
+
+        await send_to_moderation(update, context, post, "transfer", uid, {
+            "target": uid,
+            "club": transfer['owner_club'],
+            "owner_id": transfer['owner_id']
+        })
 
         try:
             await context.bot.send_message(
-                transfer["owner_id"],
-                f"❌ Игрок {users[uid]['nickname']} отклонил предложение о трансфере в {transfer['owner_club']}."
+                transfer['owner_id'],
+                f"✅ Игрок {users[uid]['nickname']} принял предложение о трансфере в {transfer['owner_club']}!\n"
+                f"Заявка отправлена на модерацию."
             )
         except:
             pass
 
         del pending_transfers[transfer_id]
         save_data()
-        await q.edit_message_text("❌ Ты отклонил предложение о трансфере", reply_markup=get_main_keyboard(uid))
+        context.user_data["transfer_id"] = None
+
+        await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
         return ConversationHandler.END
-    elif data == "manage_club" and uid in TEAM_OWNERS:
-        club = TEAM_OWNERS[uid]
-        club_status = clubs_data[club].get("status", "active")
-        await q.edit_message_text(
-            f"🏢 Управление клубом {club}",
-            reply_markup=get_manage_club_keyboard(club, club_status)
-        )
-        return ConversationHandler.END
-    elif data.startswith("close_club_"):
-        club = data.replace("close_club_", "")
-        if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
-            await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
-            return ConversationHandler.END
-
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Да, закрыть", callback_data=f"confirm_close_club_{club}"),
-                InlineKeyboardButton("❌ Нет, отмена", callback_data="manage_club")
-            ]
-        ]
-        await q.edit_message_text(
-            f"⚠️ Вы уверены, что хотите **закрыть клуб {club}**?\n\n"
-            f"После закрытия:\n"
-            f"• Вы потеряете права владельца клуба\n"
-            f"• Все игроки клуба станут свободными агентами\n"
-            f"• Кнопки трансфера исчезнут\n"
-            f"• Только модератор сможет назначить нового владельца",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return ConversationHandler.END
-    elif data.startswith("confirm_close_club_"):
-        club = data.replace("confirm_close_club_", "")
-        if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
-            await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
-            return ConversationHandler.END
-
-        players_in_club = clubs_data[club]["players"].copy()
-
-        for pid in players_in_club:
-            if pid in users:
-                users[pid]["club"] = None
-                users[pid]["free_agent"] = True
-
-        clubs_data[club]["status"] = "closed"
-        clubs_data[club]["closed_date"] = datetime.now()
-        clubs_data[club]["players"] = []
-
-        if uid in TEAM_OWNERS:
-            del TEAM_OWNERS[uid]
-
-        clubs_data[club]["owner_id"] = None
-        save_data()
-
-        await q.edit_message_text(
-            f"🔴 Клуб {club} успешно закрыт!\n\n"
-            f"Вы больше не являетесь владельцем клуба.\n"
-            f"Все игроки ({len(players_in_club)}) стали свободными агентами.\n"
-            f"Кнопки управления клубом и трансферов будут скрыты.",
-            reply_markup=get_main_keyboard(uid)
-        )
-
-        # Уведомление модераторов
-        try:
-            await context.bot.send_message(
-                MODERATION_CHAT_ID,
-                f"🔔 Клуб **{club}** закрыт владельцем @{users[uid]['username']}\n"
-                f"Освобождено игроков: {len(players_in_club)}"
-            )
-        except:
-            pass
-
-        for pid in players_in_club:
-            try:
-                await context.bot.send_message(
-                    pid,
-                    f"🔴 Клуб **{club}**, в котором вы состояли, был закрыт владельцем.\n"
-                    f"Теперь вы свободный агент.",
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
-
-        return ConversationHandler.END
-    elif data.startswith("club_players_"):
-        club = data.replace("club_players_", "")
-        players = []
-        for pid in clubs_data[club]["players"]:
-            if pid in users:
-                players.append((pid, users[pid]))
-        if not players:
-            await q.edit_message_text("❌ В клубе нет игроков",
-                                      reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
-            return ConversationHandler.END
-
-        members_count = len(players)
-        members_info = f"({members_count}/{MAX_CLUB_MEMBERS})"
-
-        kb = []
-        for pid, ud in players[:10]:
-            cd_info = ""
-            if pid in clubs_data[club]["transfer_cooldowns"]:
-                cd_date = clubs_data[club]["transfer_cooldowns"][pid]
-                if datetime.now() - cd_date < get_cooldown_delta(pid, "transfer"):
-                    remaining = get_cooldown_delta(pid, "transfer") - (datetime.now() - cd_date)
-                    cd_info = f" ⏳{remaining.seconds // 3600}ч"
-            privilege_emoji = get_user_privilege_emoji(ud)
-            kb.append([InlineKeyboardButton(f"❌ {privilege_emoji} {ud['nickname'][:15]}{cd_info}",
-                                            callback_data=f"kick_player_{pid}_{club}")])
-        kb.append([InlineKeyboardButton("🔙 Назад", callback_data="manage_club")])
-        await q.edit_message_text(f"👥 Выбери игрока для удаления {members_info}:",
-                                  reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
-    elif data.startswith("kick_player_"):
-        parts = data.split("_")
-        pid = int(parts[2])
-        club = "_".join(parts[3:])
-        if pid in clubs_data[club]["players"]:
-            clubs_data[club]["players"].remove(pid)
-            users[pid]["club"] = None
-            users[pid]["free_agent"] = True
-            save_data()
-            await q.edit_message_text(f"✅ Игрок {users[pid]['nickname']} удален из клуба",
-                                      reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
-        return ConversationHandler.END
-    elif data.startswith("club_profile_"):
-        club = data.replace("club_profile_", "")
-        await q.edit_message_text(await format_club_profile(club, clubs_data[club]), parse_mode='Markdown',
-                                  reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
-        return ConversationHandler.END
-    elif data == "moderator_panel" and uid in MODERATORS:
-        await q.edit_message_text("🛠 Панель модератора:", reply_markup=get_moderator_keyboard())
-        return ConversationHandler.END
-    elif data == "mod_ban" and uid in MODERATORS:
-        await q.edit_message_text("🚫 Введи @username и причину через пробел:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_BAN_REASON
-    elif data == "mod_unban" and uid in MODERATORS:
-        if not banned_users:
-            await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
-            return ConversationHandler.END
-        kb = []
-        for bid in list(banned_users.keys())[:10]:
-            if bid in users:
-                privilege_emoji = get_user_privilege_emoji(users[bid])
-                kb.append([InlineKeyboardButton(f"✅ {privilege_emoji} {users[bid]['nickname']}",
-                                                callback_data=f"unban_{bid}")])
-        kb.append([InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")])
-        await q.edit_message_text("Выбери пользователя для разбана:", reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
-    elif data.startswith("unban_") and uid in MODERATORS:
-        bid = int(data.split("_")[1])
-        if bid in banned_users:
-            del banned_users[bid]
-            save_data()
-            await q.edit_message_text("✅ Пользователь разбанен", reply_markup=get_moderator_keyboard())
-        return ConversationHandler.END
-    elif data == "mod_ban_list" and uid in MODERATORS:
-        if not banned_users:
-            await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
-            return ConversationHandler.END
-        text = "📋 Список забаненных:\n"
-        for bid, bd in banned_users.items():
-            if bid in users:
-                privilege_emoji = get_user_privilege_emoji(users[bid])
-                text += f"\n• {privilege_emoji} {users[bid]['nickname']}: {bd['reason']} ({bd['date'].strftime('%d.%m.%Y')})"
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")]]))
-        return ConversationHandler.END
-    elif data == "mod_reset_cd" and uid in MODERATORS:
-        await q.edit_message_text("🔄 Введи @username для сброса КД:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
-        return WAITING_FOR_RESET_CD_USER
-    elif data == "mod_force_retire" and uid in MODERATORS:
-        await q.edit_message_text("⚡ Введи @username для сброса КД на возвращение карьеры:",
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
-        return WAITING_FOR_RETIRE_COMMENT
-    elif data == "mod_give_privilege" and uid in MODERATORS:
-        await q.edit_message_text("👑 Введи @username и привилегию (player/vip/owner) через пробел:",
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
-        return WAITING_FOR_PRIVILEGE_USER
-    elif data == "back_to_main":
-        await q.edit_message_text("Главное меню:", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-    elif data == "ignore":
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-
-# ==================== ТЕКСТ ====================
-async def handle_free_agent_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    update_username(uid, update.effective_user.username or "no_username")
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
-                                        reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    comment = escape_html(update.message.text)
-    privilege = format_privilege_for_post(users[uid])
-    post = f"<b>📢 Свободный агент:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Ищет клуб.\nКомментарий: {comment}"
-    post = truncate_text(post)
-    await send_to_moderation(update, context, post, "free_agent", uid)
-    users[uid]["last_free_agent_date"] = datetime.now()
-    save_data()
-    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
-
-
-async def handle_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    update_username(uid, update.effective_user.username or "no_username")
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
-                                        reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    text = escape_html(update.message.text)
-    privilege = format_privilege_for_post(users[uid])
-    post = f"<b>📝 Свой текст:</b>\n\n{privilege} <b>{users[uid]['nickname']}</b>\n{text}"
-    post = truncate_text(post)
-    await send_to_moderation(update, context, post, "custom", uid)
-    users[uid]["last_custom_text_date"] = datetime.now()
-    save_data()
-    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
-
-
-async def handle_new_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    update_username(uid, update.effective_user.username or "no_username")
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Вы завершили карьеру. Смена ника недоступна.",
-                                        reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    new_nickname = update.message.text.strip()
-
-    is_valid, error_message = is_valid_nickname(new_nickname)
-    if not is_valid:
-        await update.message.reply_text(f"{error_message}\nПопробуй еще раз:", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_NEW_NICKNAME
-
-    if is_nickname_taken(new_nickname, uid):
-        await update.message.reply_text("❌ Этот ник уже занят другим игроком\nПопробуй другой ник:",
-                                        reply_markup=InlineKeyboardMarkup(
-                                            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
-        return WAITING_FOR_NEW_NICKNAME
-
-    old_nickname = users[uid]['nickname']
-    privilege = format_privilege_for_post(users[uid])
-    post = f"<b>❗️ Смена никнейма в тм:</b>\n\n🔘 {privilege} @{users[uid]['username']} — <b>{old_nickname}</b> ➡️ <b>{new_nickname}</b>"
-    post = truncate_text(post)
-    await send_to_moderation(update, context, post, "nickname_change", uid,
-                             {"new_nickname": new_nickname, "old_nickname": old_nickname})
-
-    await update.message.reply_text("✅ Заявка на смену никнейма отправлена на модерацию!",
-                                    reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
-
-
-async def handle_retire_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-
-    if uid in users:
-        update_username(uid, update.effective_user.username or "no_username")
-
-    if uid in MODERATORS and context.user_data.get("force_retire"):
-        username = update.message.text.strip().replace('@', '')
-        target_id = None
-        for uid2, user_data in users.items():
-            if user_data['username'] == username:
-                target_id = uid2
-                break
-        if target_id:
-            users[target_id]["retire_date"] = None
-            save_data()
-            await update.message.reply_text(f"✅ КД на возвращение карьеры сброшен для @{username}",
-                                            reply_markup=get_moderator_keyboard())
-        else:
-            await update.message.reply_text("❌ Игрок не найден", reply_markup=get_moderator_keyboard())
-        context.user_data["force_retire"] = False
-        return ConversationHandler.END
-
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    comment = escape_html(update.message.text)
-    privilege = format_privilege_for_post(users[uid])
-    post = f"<b>🥀 Завершение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Завершает.\nКомментарий: {comment}"
-    post = truncate_text(post)
-    await send_to_moderation(update, context, post, "retire", uid)
-    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
-
-
-async def handle_resume_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    update_username(uid, update.effective_user.username or "no_username")
-
-    if not users[uid].get("retired"):
-        await update.message.reply_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    comment = escape_html(update.message.text)
-    privilege = format_privilege_for_post(users[uid])
-    post = f"<b>🌹 Возвращение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Возвращается.\nКомментарий: {comment}"
-    post = truncate_text(post)
-    await send_to_moderation(update, context, post, "resume", uid)
-    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
-
-
-async def handle_transfer_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
-        return ConversationHandler.END
-
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("❌ Зарегистрируйся через /start")
-        return ConversationHandler.END
-
-    update_username(uid, update.effective_user.username or "no_username")
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.",
-                                        reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    if uid not in TEAM_OWNERS:
-        await update.message.reply_text("❌ У вас нет прав владельца клуба")
-        return ConversationHandler.END
-
-    nickname = update.message.text.strip()
-    club = context.user_data.get("transfer_club")
-
-    if not club:
-        await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    if clubs_data[club]["status"] == "closed":
-        await update.message.reply_text(
-            "❌ Ваш клуб закрыт. Трансферы недоступны.",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
-        await update.message.reply_text(
-            f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
-            f"Чтобы пригласить нового игрока, нужно кого-то удалить.",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    is_valid, error_message = is_valid_nickname(nickname)
-    if not is_valid:
-        await update.message.reply_text(
-            f"{error_message}\nПопробуй еще раз:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
-        )
-        return WAITING_FOR_TRANSFER_NICKNAME
-
-    target_id = find_user_by_nickname(nickname)
-
-    if not target_id:
-        await update.message.reply_text(
-            f"❌ Игрок с ником '{nickname}' не найден\nПроверь правильность написания или попробуй другой ник:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
-        )
-        return WAITING_FOR_TRANSFER_NICKNAME
-
-    if is_banned(target_id):
-        await update.message.reply_text(
-            "❌ Этот игрок забанен и не может участвовать в трансферах",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    if users[target_id].get("retired"):
-        await update.message.reply_text(
-            f"❌ Игрок {users[target_id]['nickname']} завершил карьеру и не может участвовать в трансферах",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    if target_id in clubs_data[club]["players"]:
-        await update.message.reply_text(
-            f"❌ Игрок {users[target_id]['nickname']} уже в вашем клубе",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    if not users[target_id].get("free_agent"):
-        current_club = users[target_id].get("club")
-        if current_club:
-            await update.message.reply_text(
-                f"❌ Игрок {users[target_id]['nickname']} уже в клубе {current_club}.\n"
-                f"Предложение о трансфере можно отправить только свободному агенту.",
-                reply_markup=get_main_keyboard(uid)
-            )
-            return ConversationHandler.END
-
-    ok, msg = check_cooldown(target_id, club)
-    if not ok:
-        await update.message.reply_text(
-            f"❌ У игрока ещё КД {msg}",
-            reply_markup=get_main_keyboard(uid)
-        )
-        return ConversationHandler.END
-
-    transfer_id = len(pending_transfers) + 1
-    pending_transfers[transfer_id] = {
-        "owner_id": uid,
-        "owner_club": club,
-        "target_id": target_id,
-        "status": "pending"
-    }
-    save_data()
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Принять", callback_data=f"accept_transfer_{transfer_id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_transfer_{transfer_id}")
-        ]
-    ]
-
-    try:
-        await context.bot.send_message(
-            target_id,
-            f"📢 Вам предложили трансфер в клуб {club}!\n\n"
-            f"От: {users[uid]['nickname']}\n"
-            f"Клуб: {club}\n\n"
-            f"Хотите присоединиться?",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        await update.message.reply_text(
-            f"✅ Запрос на трансфер отправлен игроку {users[target_id]['nickname']}. Ожидайте ответа.",
-            reply_markup=get_main_keyboard(uid)
-        )
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Не удалось отправить запрос игроку: {e}",
-            reply_markup=get_main_keyboard(uid)
-        )
-
-    return ConversationHandler.END
-
-
-async def handle_transfer_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_private_chat(update):
-        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        logger.error(f"Ошибка в handle_transfer_comment: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
         return ConversationHandler.END
-
-    uid = update.effective_user.id
-
-    if uid in users:
-        update_username(uid, update.effective_user.username or "no_username")
-
-    if users[uid].get("retired"):
-        await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.",
-                                        reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    transfer_id = context.user_data.get("transfer_id")
-    if not transfer_id or transfer_id not in pending_transfers:
-        await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    transfer = pending_transfers[transfer_id]
-    if transfer["target_id"] != uid:
-        await update.message.reply_text("❌ Это не ваш запрос", reply_markup=get_main_keyboard(uid))
-        return ConversationHandler.END
-
-    if clubs_data[transfer['owner_club']]["status"] == "closed":
-        await update.message.reply_text(
-            "❌ Клуб закрыт. Трансфер невозможен.",
-            reply_markup=get_main_keyboard(uid)
-        )
-        try:
-            await context.bot.send_message(
-                transfer["owner_id"],
-                f"❌ Игрок {users[uid]['nickname']} не может принять трансфер, так как клуб закрыт."
-            )
-        except:
-            pass
-        del pending_transfers[transfer_id]
-        save_data()
-        return ConversationHandler.END
-
-    if len(clubs_data[transfer['owner_club']]["players"]) >= MAX_CLUB_MEMBERS:
-        await update.message.reply_text(
-            f"❌ В клубе {transfer['owner_club']} уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).\n"
-            f"Трансфер невозможен.",
-            reply_markup=get_main_keyboard(uid)
-        )
-        try:
-            await context.bot.send_message(
-                transfer["owner_id"],
-                f"❌ Игрок {users[uid]['nickname']} не может принять трансфер, так как в клубе {transfer['owner_club']} нет мест."
-            )
-        except:
-            pass
-        del pending_transfers[transfer_id]
-        save_data()
-        return ConversationHandler.END
-
-    comment = escape_html(update.message.text)
-    privilege = format_privilege_for_post(users[uid])
-
-    post = f"<b>📢 Трансфер в клуб:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) ➡️ {transfer['owner_club']}\nКомментарий: {comment}"
-    post = truncate_text(post)
-
-    await send_to_moderation(update, context, post, "transfer", uid, {
-        "target": uid,
-        "club": transfer['owner_club'],
-        "owner_id": transfer['owner_id']
-    })
-
-    try:
-        await context.bot.send_message(
-            transfer['owner_id'],
-            f"✅ Игрок {users[uid]['nickname']} принял предложение о трансфере в {transfer['owner_club']}!\n"
-            f"Заявка отправлена на модерацию."
-        )
-    except:
-        pass
-
-    del pending_transfers[transfer_id]
-    save_data()
-    context.user_data["transfer_id"] = None
-
-    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
-    return ConversationHandler.END
 
 
 async def handle_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1984,6 +2164,8 @@ async def handle_reset_cd_user(update: Update, context: ContextTypes.DEFAULT_TYP
             del users[target_id]["last_custom_text_date"]
         if "last_nickname_change_date" in users[target_id]:
             del users[target_id]["last_nickname_change_date"]
+        if "last_request_time" in users[target_id]:
+            del users[target_id]["last_request_time"]
     save_data()
     await update.message.reply_text(f"✅ КД сброшены для @{username}", reply_markup=get_moderator_keyboard())
     return ConversationHandler.END
@@ -2053,6 +2235,9 @@ async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except:
         pass
+
+    # Не удаляем глобальный КД, так как он уже установлен при отправке заявки.
+    # Специфичный КД не устанавливался, поэтому игрок может попробовать снова через 2 минуты.
 
     del pending_posts[post_id]
     save_data()
@@ -2216,16 +2401,21 @@ async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 else:
                     raise
 
-        if post["type"] == "retire" and post["author_id"] in users:
-            users[post["author_id"]]["retired"] = True
-            users[post["author_id"]]["retire_date"] = datetime.now()
-        elif post["type"] == "resume" and post["author_id"] in users:
-            users[post["author_id"]]["retired"] = False
-        elif post["type"] == "nickname_change" and post["author_id"] in users:
-            old_nickname = users[post["author_id"]]["nickname"]
+        # Установка специфичных КД после одобрения
+        if post["type"] == "free_agent":
+            users[post["author_id"]]["last_free_agent_date"] = datetime.now()
+        elif post["type"] == "custom":
+            users[post["author_id"]]["last_custom_text_date"] = datetime.now()
+        elif post["type"] == "nickname_change":
             new_nickname = post["extra_data"].get("new_nickname")
             users[post["author_id"]]["nickname"] = new_nickname
             users[post["author_id"]]["last_nickname_change_date"] = datetime.now()
+        elif post["type"] == "retire":
+            users[post["author_id"]]["retired"] = True
+            users[post["author_id"]]["retire_date"] = datetime.now()
+        elif post["type"] == "resume":
+            users[post["author_id"]]["retired"] = False
+            # retire_date не сбрасываем, остаётся для КД возврата
         elif post["type"] == "transfer":
             target = post["extra_data"].get("target")
             club = post["extra_data"].get("club")
