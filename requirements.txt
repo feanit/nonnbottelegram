@@ -1,3 +1,2 @@
 pyTelegramBotAPI
-pip install python-telegram-bot
-pip freeze
+install python-telegram-bot
