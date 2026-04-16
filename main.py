@@ -94,6 +94,7 @@ CLUBS = [
     "Vetra Gaming",
     "Qerix",
     "Mortal Sinners",
+    "Unity Force",
 ]
 
 TEAM_OWNERS: Dict[int, str] = {}
