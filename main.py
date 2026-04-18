@@ -116,7 +116,8 @@ DATA_FILE = "bot_data.json"
     WAITING_FOR_REJECT_REASON,
     WAITING_FOR_TRANSFER_NICKNAME,
     WAITING_FOR_CLUB_CLOSE_CONFIRM,
-) = range(13)
+    WAITING_FOR_IDEA_TEXT,           # новое состояние
+) = range(14)
 
 # ==================== БАЗА ДАННЫХ ====================
 users: Dict[int, dict] = {}
@@ -469,6 +470,8 @@ def get_main_keyboard(user_id: int):
     if is_banned(user_id):
         return None
 
+    keyboard = []
+
     if users.get(user_id, {}).get("retired"):
         keyboard = [
             [InlineKeyboardButton("👤 Профиль", callback_data="profile"),
@@ -495,6 +498,9 @@ def get_main_keyboard(user_id: int):
                 keyboard.append([
                     InlineKeyboardButton("🏢 Управление клубом (закрыт)", callback_data="manage_club")
                 ])
+
+    # Кнопка "Предложить идею" доступна всем (даже retired)
+    keyboard.append([InlineKeyboardButton("💡 Предложить идею", callback_data="suggest_idea")])
 
     if user_id in MODERATORS:
         keyboard.append([InlineKeyboardButton("🛠 Модератор", callback_data="moderator_panel")])
@@ -1238,7 +1244,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🚫 Вы забанены")
             return ConversationHandler.END
 
-        if users[uid].get("retired") and data not in ["profile", "resume", "back_to_main"]:
+        if users[uid].get("retired") and data not in ["profile", "resume", "back_to_main", "suggest_idea"]:
             await q.edit_message_text(
                 "❌ Вы завершили карьеру. Чтобы создавать заявки, сначала возобновите карьеру.",
                 reply_markup=get_main_keyboard(uid)
@@ -1633,6 +1639,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data == "ignore":
             return ConversationHandler.END
+
+        elif data == "suggest_idea":
+            await q.edit_message_text(
+                "💡 Напиши свою идею или предложение по улучшению бота:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            return WAITING_FOR_IDEA_TEXT
 
         return ConversationHandler.END
     except Exception as e:
@@ -2257,7 +2270,45 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ==================== НОВЫЕ КОМАНДЫ: /club и /player ====================
+# ==================== НОВЫЙ ОБРАБОТЧИК ИДЕЙ ====================
+async def handle_idea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not is_private_chat(update):
+            await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+            return ConversationHandler.END
+
+        uid = update.effective_user.id
+        if uid not in users:
+            await update.message.reply_text("❌ Зарегистрируйся через /start")
+            return ConversationHandler.END
+
+        update_username(uid, update.effective_user.username or "no_username")
+
+        idea_text = escape_html(update.message.text)
+
+        # Формируем сообщение для модераторов
+        user_info = f"{get_user_privilege_text(users[uid])} {users[uid]['nickname']} (@{users[uid]['username']})"
+        post = f"<b>💡 Предложение от пользователя</b>\n\n{user_info}\n\nТекст идеи:\n{idea_text}"
+        post = truncate_text(post)
+
+        # Отправляем в чат модерации (не сохраняем в pending_posts)
+        try:
+            await context.bot.send_message(MODERATION_CHAT_ID, post, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Ошибка отправки идеи в модерацию: {e}")
+
+        await update.message.reply_text(
+            "✅ Спасибо за идею! Мы рассмотрим её в ближайшее время.",
+            reply_markup=get_main_keyboard(uid)
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Ошибка в handle_idea_text: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        return ConversationHandler.END
+
+
+# ==================== КОМАНДЫ /club и /player ====================
 async def club_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает информацию о клубе. Работает в любом чате."""
     try:
@@ -2477,7 +2528,7 @@ def main():
                 CommandHandler("closemyclub", close_my_club),
                 CommandHandler("transfer_player", transfer_player),
                 CallbackQueryHandler(button_handler,
-                                     pattern="^(free_agent|custom_text|retire|resume|change_nickname|transfer|accept_transfer_.*|mod_ban|mod_reset_cd|mod_force_retire|mod_give_privilege|reject_.*)$")
+                                     pattern="^(free_agent|custom_text|retire|resume|change_nickname|transfer|accept_transfer_.*|mod_ban|mod_reset_cd|mod_force_retire|mod_give_privilege|reject_.*|suggest_idea)$")
             ],
             states={
                 REGISTER_NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_nickname)],
@@ -2496,6 +2547,7 @@ def main():
                 WAITING_FOR_PRIVILEGE_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_privilege_user)],
                 WAITING_FOR_REJECT_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reject_reason)],
                 WAITING_FOR_CLUB_CLOSE_CONFIRM: [],
+                WAITING_FOR_IDEA_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idea_text)],
             },
             fallbacks=[
                 CommandHandler("cancel", cancel),
