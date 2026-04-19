@@ -1,4 +1,7 @@
 {
+  "$schema": "https://railway.com/railway.schema.json"
+}
+{
   "users": {
     "8516314184": {
       "nickname": "nortez",
