@@ -127,7 +127,6 @@ def execute_update(query: str, params: tuple = ()):
     execute_query(query, params, fetch=False)
 
 # ==================== ГЛОБАЛЬНЫЕ КЭШИ ====================
-# Загружаются из БД при старте для быстрого доступа.
 users: Dict[int, dict] = {}
 clubs_data: Dict[str, dict] = {}
 pending_posts: Dict[int, dict] = {}
@@ -140,6 +139,12 @@ CLUB_STATUS = {
     "active": "🟢 Активен",
     "closed": "🔴 Закрыт"
 }
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ====================
 def init_postgres():
@@ -224,7 +229,6 @@ def migrate_from_json():
         logger.info("📁 Файл bot_data.json не найден, миграция не требуется")
         return
 
-    # Проверим, есть ли уже данные в таблице users
     existing = execute_query("SELECT COUNT(*) FROM users", fetch=True)
     if existing and existing[0]['count'] > 0:
         logger.info("✅ В базе уже есть данные, пропускаем миграцию")
@@ -315,7 +319,6 @@ def migrate_from_json():
     for pid_str, post in posts_json.items():
         pid = int(pid_str)
         extra = post.get('extra_data', {})
-        # Преобразуем datetime в extra_data в строки ISO (JSONB сам обработает)
         extra_clean = {}
         for k, v in extra.items():
             if isinstance(v, datetime):
@@ -351,7 +354,6 @@ def migrate_from_json():
         ))
 
     logger.info("✅ Миграция из JSON завершена")
-    # Переименуем файл, чтобы больше не использовать
     os.rename(json_file, json_file + ".migrated")
 
 # ==================== ЗАГРУЗКА ДАННЫХ В КЭШ ====================
@@ -359,7 +361,6 @@ def load_data_to_cache():
     """Загружает данные из PostgreSQL в глобальные словари."""
     global users, clubs_data, banned_users, pending_posts, pending_transfers, TEAM_OWNERS
 
-    # Инициализация клубов
     for club in CLUBS:
         clubs_data[club] = {
             "owner_id": None,
@@ -370,7 +371,6 @@ def load_data_to_cache():
         }
 
     try:
-        # Пользователи
         rows = execute_query("SELECT * FROM users", fetch=True)
         for row in rows:
             uid = row['user_id']
@@ -389,7 +389,6 @@ def load_data_to_cache():
                 "reg_date": row['reg_date'],
             }
 
-        # Клубы
         rows = execute_query("SELECT * FROM clubs", fetch=True)
         for row in rows:
             name = row['name']
@@ -400,7 +399,6 @@ def load_data_to_cache():
                 if row['owner_id']:
                     TEAM_OWNERS[row['owner_id']] = name
 
-        # Игроки в клубах
         rows = execute_query("SELECT * FROM club_players", fetch=True)
         for row in rows:
             club = row['club_name']
@@ -408,7 +406,6 @@ def load_data_to_cache():
             if club in clubs_data and uid in users:
                 clubs_data[club]['players'].append(uid)
 
-        # Кулдауны трансферов
         rows = execute_query("SELECT * FROM transfer_cooldowns", fetch=True)
         for row in rows:
             club = row['club_name']
@@ -416,7 +413,6 @@ def load_data_to_cache():
             if club in clubs_data and uid in users:
                 clubs_data[club]['transfer_cooldowns'][uid] = row['cooldown_date']
 
-        # Баны
         rows = execute_query("SELECT * FROM bans", fetch=True)
         for row in rows:
             uid = row['user_id']
@@ -426,12 +422,10 @@ def load_data_to_cache():
                     "date": row['ban_date']
                 }
 
-        # pending_posts
         rows = execute_query("SELECT * FROM pending_posts", fetch=True)
         for row in rows:
             pid = row['post_id']
             extra = row['extra_data'] if row['extra_data'] else {}
-            # Преобразуем строки ISO обратно в datetime при необходимости
             for k, v in extra.items():
                 if isinstance(v, str):
                     try:
@@ -445,7 +439,6 @@ def load_data_to_cache():
                 "extra_data": extra
             }
 
-        # pending_transfers
         rows = execute_query("SELECT * FROM pending_transfers", fetch=True)
         for row in rows:
             tid = row['transfer_id']
@@ -456,12 +449,11 @@ def load_data_to_cache():
                 "status": row['status']
             }
 
-        logger.info(f"✅ Кэш загружен: {len(users)} пользователей, {len(banned_users)} банов, "
-                    f"{len(pending_posts)} заявок, {len(pending_transfers)} трансферов")
+        logger.info(f"✅ Кэш загружен: {len(users)} пользователей, {len(banned_users)} банов")
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки кэша: {e}")
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def is_private_chat(update: Update) -> bool:
     if update.effective_chat is None:
         return False
@@ -802,8 +794,7 @@ def format_player_info(user_data: dict, user_id: int):
 📅 **Начало карьеры:** {safe_start}
 """
 
-# ==================== ОБРАБОТЧИКИ КОМАНД (многие изменены для работы с БД) ====================
-# Состояния ConversationHandler
+# ==================== СОСТОЯНИЯ ====================
 (
     REGISTER_NICKNAME,
     WAITING_FOR_FREE_AGENT_COMMENT,
@@ -821,6 +812,7 @@ def format_player_info(user_data: dict, user_id: int):
     WAITING_FOR_IDEA_TEXT,
 ) = range(14)
 
+# ==================== ОСНОВНЫЕ ОБРАБОТЧИКИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private_chat(update):
         await update.message.reply_text("🤖 Этот бот работает только в личных сообщениях.")
@@ -857,7 +849,6 @@ async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     username = update.effective_user.username or "no_username"
     now = datetime.now()
-    # Вставка в БД
     execute_update("""
         INSERT INTO users (
             user_id, nickname, username, free_agent, club, retired,
@@ -866,7 +857,6 @@ async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (uid, nickname, username, True, None, False, None, None, None, None, "player", now))
 
-    # Добавляем в кэш
     users[uid] = {
         "nickname": nickname,
         "username": username,
@@ -884,185 +874,6 @@ async def register_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Регистрация завершена, {nickname}!", reply_markup=get_main_keyboard(uid))
     return ConversationHandler.END
 
-# --- Команды модераторов (обновлены для БД) ---
-async def reset_cds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in MODERATORS:
-        await update.message.reply_text("❌ Нет прав")
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /reset_cds ID_игрока")
-        return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом")
-        return
-    if target_id not in users:
-        await update.message.reply_text("❌ Игрок с таким ID не найден")
-        return
-
-    # Сброс в БД
-    execute_update("DELETE FROM transfer_cooldowns WHERE user_id = %s", (target_id,))
-    execute_update("""
-        UPDATE users SET
-            last_free_agent_date = NULL,
-            last_custom_text_date = NULL,
-            retire_date = NULL,
-            last_nickname_change_date = NULL,
-            last_request_time = NULL
-        WHERE user_id = %s
-    """, (target_id,))
-
-    # Обновляем кэш
-    for club in clubs_data:
-        if target_id in clubs_data[club]["transfer_cooldowns"]:
-            del clubs_data[club]["transfer_cooldowns"][target_id]
-    if target_id in users:
-        users[target_id]["last_free_agent_date"] = None
-        users[target_id]["last_custom_text_date"] = None
-        users[target_id]["retire_date"] = None
-        users[target_id]["last_nickname_change_date"] = None
-        users[target_id]["last_request_time"] = None
-
-    await update.message.reply_text(f"✅ Все КД сброшены для игрока с ID {target_id}")
-
-async def force_retire(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in MODERATORS:
-        await update.message.reply_text("❌ Нет прав")
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /force_retire ID_игрока")
-        return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом")
-        return
-    if target_id not in users:
-        await update.message.reply_text("❌ Игрок с таким ID не найден")
-        return
-
-    execute_update("UPDATE users SET retire_date = NULL WHERE user_id = %s", (target_id,))
-    users[target_id]["retire_date"] = None
-    await update.message.reply_text(f"✅ КД на возвращение карьеры сброшен для игрока с ID {target_id}")
-
-async def give_privilege(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in MODERATORS:
-        await update.message.reply_text("❌ Нет прав")
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("❌ Использование: /give_privilege ID_игрока player/vip/owner")
-        return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом")
-        return
-    privilege = context.args[1].lower()
-    if privilege not in ["player", "vip", "owner"]:
-        await update.message.reply_text("❌ Доступные привилегии: player, vip, owner")
-        return
-    if target_id not in users:
-        await update.message.reply_text("❌ Игрок с таким ID не найден")
-        return
-
-    execute_update("UPDATE users SET privilege = %s WHERE user_id = %s", (privilege, target_id))
-    users[target_id]["privilege"] = privilege
-
-    privilege_text = PRIVILEGES.get(privilege, "[Игрок]")
-    await update.message.reply_text(f"✅ Игроку с ID {target_id} выдана привилегия {privilege_text}!")
-    try:
-        await context.bot.send_message(target_id, f"🎉 Вам выдана привилегия {privilege_text}!")
-    except:
-        pass
-
-# --- Команды управления клубом (обновлены) ---
-async def close_club_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in MODERATORS:
-        await update.message.reply_text("❌ У вас нет прав модератора")
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /close_club ID_владельца")
-        return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом")
-        return
-    if target_id not in users or target_id not in TEAM_OWNERS:
-        await update.message.reply_text(f"❌ Пользователь с ID {target_id} не является владельцем клуба")
-        return
-    club_name = TEAM_OWNERS[target_id]
-    if clubs_data[club_name]["status"] == "closed":
-        await update.message.reply_text(f"❌ Клуб {club_name} уже закрыт")
-        return
-
-    players_in_club = clubs_data[club_name]["players"].copy()
-    # Обновление БД
-    execute_update("UPDATE clubs SET status = 'closed', closed_date = %s, owner_id = NULL WHERE name = %s",
-                   (datetime.now(), club_name))
-    for pid in players_in_club:
-        execute_update("UPDATE users SET club = NULL, free_agent = TRUE WHERE user_id = %s", (pid,))
-    execute_update("DELETE FROM club_players WHERE club_name = %s", (club_name,))
-    if target_id in TEAM_OWNERS:
-        del TEAM_OWNERS[target_id]
-    # Обновление кэша
-    clubs_data[club_name]["status"] = "closed"
-    clubs_data[club_name]["closed_date"] = datetime.now()
-    clubs_data[club_name]["owner_id"] = None
-    clubs_data[club_name]["players"] = []
-    for pid in players_in_club:
-        if pid in users:
-            users[pid]["club"] = None
-            users[pid]["free_agent"] = True
-
-    await update.message.reply_text(
-        f"✅ Клуб {club_name} успешно закрыт модератором!\n"
-        f"Владелец с ID {target_id} больше не имеет прав на клуб.\n"
-        f"Все игроки ({len(players_in_club)}) стали свободными агентами."
-    )
-    # Уведомления...
-
-async def set_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in MODERATORS:
-        await update.message.reply_text("❌ Нет прав")
-        return ConversationHandler.END
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("❌ Использование: /set_owner ID_пользователя Название клуба")
-        return ConversationHandler.END
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом")
-        return ConversationHandler.END
-    club_name = " ".join(context.args[1:]).strip('"')
-    if club_name not in CLUBS:
-        await update.message.reply_text(f"❌ Клуб не найден")
-        return ConversationHandler.END
-    if target_id not in users:
-        await update.message.reply_text(f"❌ Пользователь с ID {target_id} не найден")
-        return ConversationHandler.END
-
-    old_owner_id = clubs_data[club_name]["owner_id"]
-    if old_owner_id and old_owner_id in TEAM_OWNERS:
-        del TEAM_OWNERS[old_owner_id]
-
-    execute_update("UPDATE clubs SET owner_id = %s, status = 'active', closed_date = NULL WHERE name = %s",
-                   (target_id, club_name))
-    TEAM_OWNERS[target_id] = club_name
-    clubs_data[club_name]["owner_id"] = target_id
-    clubs_data[club_name]["status"] = "active"
-    clubs_data[club_name]["closed_date"] = None
-
-    await update.message.reply_text(f"✅ Владелец назначен!")
-    return ConversationHandler.END
-
-# --- Основной обработчик кнопок (фрагмент, остальные части адаптированы аналогично) ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1098,9 +909,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-        # ... (остальные ветки data == "free_agent", "custom_text" и т.д. изменены аналогично: после проверок вставляем/обновляем записи в БД через execute_update)
-
-        # Пример для free_agent (внутри button_handler)
         if data == "free_agent":
             ok_req, msg_req = check_request_cooldown(uid)
             if not ok_req:
@@ -1114,14 +922,331 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
             return WAITING_FOR_FREE_AGENT_COMMENT
 
-        # ... (остальные обработчики)
+        elif data == "custom_text":
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_custom_text_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ {msg}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши свой текст:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_CUSTOM_TEXT
 
+        elif data == "profile":
+            await q.edit_message_text(format_profile(users[uid], uid), parse_mode='MarkdownV2',
+                                      reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "change_nickname":
+            if users[uid].get("retired"):
+                await q.edit_message_text("❌ Вы завершили карьеру. Смена ника недоступна.",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_nickname_change_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ Сменить ник можно раз в {NICKNAME_CHANGE_COOLDOWN_DAYS} дней.\n{msg}",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text(
+                f"✏️ Введи новый ник (только английские буквы, цифры и символ _, минимум {MIN_NICKNAME_LENGTH} символа):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_NEW_NICKNAME
+
+        elif data == "retire":
+            if users[uid].get("retired"):
+                await q.edit_message_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши комментарий к завершению карьеры:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_RETIRE_COMMENT
+
+        elif data == "resume":
+            if not users[uid].get("retired"):
+                await q.edit_message_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok_req, msg_req = check_request_cooldown(uid)
+            if not ok_req:
+                await q.edit_message_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            ok, msg = check_resume_cooldown(uid)
+            if not ok:
+                await q.edit_message_text(f"❌ {msg}", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text("📝 Напиши комментарий к возвращению:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_RESUME_COMMENT
+
+        elif data == "transfer" and uid in TEAM_OWNERS:
+            club = TEAM_OWNERS[uid]
+            if clubs_data[club]["status"] == "closed":
+                await q.edit_message_text("❌ Ваш клуб закрыт. Трансферы недоступны.", reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
+                await q.edit_message_text(f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).",
+                                          reply_markup=get_main_keyboard(uid))
+                return ConversationHandler.END
+            await q.edit_message_text(
+                f"🔄 Введи ник игрока, которому хочешь предложить трансфер в {club}:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            context.user_data["transfer_club"] = club
+            return WAITING_FOR_TRANSFER_NICKNAME
+
+        elif data.startswith("accept_transfer_"):
+            transfer_id = int(data.split("_")[2])
+            if transfer_id not in pending_transfers:
+                await q.edit_message_text("❌ Этот запрос уже обработан")
+                return ConversationHandler.END
+            transfer = pending_transfers[transfer_id]
+            if transfer["target_id"] != uid:
+                await q.edit_message_text("❌ Это не ваш запрос")
+                return ConversationHandler.END
+            if clubs_data[transfer['owner_club']]["status"] == "closed":
+                await q.edit_message_text("❌ Клуб закрыт. Трансфер невозможен.", reply_markup=get_main_keyboard(uid))
+                del pending_transfers[transfer_id]
+                execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+                return ConversationHandler.END
+            if len(clubs_data[transfer['owner_club']]["players"]) >= MAX_CLUB_MEMBERS:
+                await q.edit_message_text(f"❌ В клубе {transfer['owner_club']} уже максимальное количество игроков.",
+                                          reply_markup=get_main_keyboard(uid))
+                del pending_transfers[transfer_id]
+                execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+                return ConversationHandler.END
+            context.user_data["transfer_id"] = transfer_id
+            await q.edit_message_text("📝 Напиши комментарий к трансферу (почему хочешь перейти):",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_TRANSFER_COMMENT
+
+        elif data.startswith("decline_transfer_"):
+            transfer_id = int(data.split("_")[2])
+            if transfer_id not in pending_transfers:
+                await q.edit_message_text("❌ Этот запрос уже обработан")
+                return ConversationHandler.END
+            transfer = pending_transfers[transfer_id]
+            if transfer["target_id"] != uid:
+                await q.edit_message_text("❌ Это не ваш запрос")
+                return ConversationHandler.END
+            try:
+                await context.bot.send_message(
+                    transfer["owner_id"],
+                    f"❌ Игрок {users[uid]['nickname']} отклонил предложение о трансфере в {transfer['owner_club']}."
+                )
+            except:
+                pass
+            del pending_transfers[transfer_id]
+            execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+            await q.edit_message_text("❌ Ты отклонил предложение о трансфере", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "manage_club" and uid in TEAM_OWNERS:
+            club = TEAM_OWNERS[uid]
+            club_status = clubs_data[club].get("status", "active")
+            await q.edit_message_text(
+                f"🏢 Управление клубом {club}",
+                reply_markup=get_manage_club_keyboard(club, club_status)
+            )
+            return ConversationHandler.END
+
+        elif data.startswith("close_club_"):
+            club = data.replace("close_club_", "")
+            if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
+                await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
+                return ConversationHandler.END
+            keyboard = [
+                [InlineKeyboardButton("✅ Да, закрыть", callback_data=f"confirm_close_club_{club}"),
+                 InlineKeyboardButton("❌ Нет, отмена", callback_data="manage_club")]
+            ]
+            await q.edit_message_text(
+                f"⚠️ Вы уверены, что хотите **закрыть клуб {club}**?\n\n"
+                f"После закрытия:\n"
+                f"• Вы потеряете права владельца клуба\n"
+                f"• Все игроки клуба станут свободными агентами\n"
+                f"• Кнопки трансфера исчезнут\n"
+                f"• Только модератор сможет назначить нового владельца",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return ConversationHandler.END
+
+        elif data.startswith("confirm_close_club_"):
+            club = data.replace("confirm_close_club_", "")
+            if uid not in TEAM_OWNERS or TEAM_OWNERS[uid] != club:
+                await q.edit_message_text("❌ У вас нет прав на управление этим клубом")
+                return ConversationHandler.END
+
+            players_in_club = clubs_data[club]["players"].copy()
+            execute_update("UPDATE clubs SET status = 'closed', closed_date = %s, owner_id = NULL WHERE name = %s",
+                           (datetime.now(), club))
+            for pid in players_in_club:
+                execute_update("UPDATE users SET club = NULL, free_agent = TRUE WHERE user_id = %s", (pid,))
+                if pid in users:
+                    users[pid]["club"] = None
+                    users[pid]["free_agent"] = True
+            execute_update("DELETE FROM club_players WHERE club_name = %s", (club,))
+            if uid in TEAM_OWNERS:
+                del TEAM_OWNERS[uid]
+            clubs_data[club]["status"] = "closed"
+            clubs_data[club]["closed_date"] = datetime.now()
+            clubs_data[club]["owner_id"] = None
+            clubs_data[club]["players"] = []
+
+            await q.edit_message_text(
+                f"🔴 Клуб {club} успешно закрыт!\n\n"
+                f"Вы больше не являетесь владельцем клуба.\n"
+                f"Все игроки ({len(players_in_club)}) стали свободными агентами.",
+                reply_markup=get_main_keyboard(uid)
+            )
+            for pid in players_in_club:
+                try:
+                    await context.bot.send_message(
+                        pid,
+                        f"🔴 Клуб **{club}**, в котором вы состояли, был закрыт владельцем.\n"
+                        f"Теперь вы свободный агент.",
+                        parse_mode='Markdown'
+                    )
+                except:
+                    pass
+            return ConversationHandler.END
+
+        elif data.startswith("club_players_"):
+            club = data.replace("club_players_", "")
+            players = []
+            for pid in clubs_data[club]["players"]:
+                if pid in users:
+                    players.append((pid, users[pid]))
+            if not players:
+                await q.edit_message_text("❌ В клубе нет игроков",
+                                          reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+                return ConversationHandler.END
+            members_count = len(players)
+            members_info = f"({members_count}/{MAX_CLUB_MEMBERS})"
+            kb = []
+            for pid, ud in players[:10]:
+                cd_info = ""
+                if pid in clubs_data[club]["transfer_cooldowns"]:
+                    cd_date = clubs_data[club]["transfer_cooldowns"][pid]
+                    if datetime.now() - cd_date < get_cooldown_delta(pid, "transfer"):
+                        remaining = get_cooldown_delta(pid, "transfer") - (datetime.now() - cd_date)
+                        cd_info = f" ⏳{remaining.seconds // 3600}ч"
+                privilege_emoji = get_user_privilege_emoji(ud)
+                kb.append([InlineKeyboardButton(f"❌ {privilege_emoji} {ud['nickname'][:15]}{cd_info}",
+                                                callback_data=f"kick_player_{pid}_{club}")])
+            kb.append([InlineKeyboardButton("🔙 Назад", callback_data="manage_club")])
+            await q.edit_message_text(f"👥 Выбери игрока для удаления {members_info}:",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+        elif data.startswith("kick_player_"):
+            parts = data.split("_")
+            pid = int(parts[2])
+            club = "_".join(parts[3:])
+            if pid in clubs_data[club]["players"]:
+                clubs_data[club]["players"].remove(pid)
+                users[pid]["club"] = None
+                users[pid]["free_agent"] = True
+                execute_update("DELETE FROM club_players WHERE club_name = %s AND user_id = %s", (club, pid))
+                execute_update("UPDATE users SET club = NULL, free_agent = TRUE WHERE user_id = %s", (pid,))
+                await q.edit_message_text(f"✅ Игрок {users[pid]['nickname']} удален из клуба",
+                                          reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+            return ConversationHandler.END
+
+        elif data.startswith("club_profile_"):
+            club = data.replace("club_profile_", "")
+            await q.edit_message_text(await format_club_profile(club, clubs_data[club]), parse_mode='Markdown',
+                                      reply_markup=get_manage_club_keyboard(club, clubs_data[club]["status"]))
+            return ConversationHandler.END
+
+        elif data == "moderator_panel" and uid in MODERATORS:
+            await q.edit_message_text("🛠 Панель модератора:", reply_markup=get_moderator_keyboard())
+            return ConversationHandler.END
+
+        elif data == "mod_ban" and uid in MODERATORS:
+            await q.edit_message_text("🚫 Введи @username и причину через пробел:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+            return WAITING_FOR_BAN_REASON
+
+        elif data == "mod_unban" and uid in MODERATORS:
+            if not banned_users:
+                await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
+                return ConversationHandler.END
+            kb = []
+            for bid in list(banned_users.keys())[:10]:
+                if bid in users:
+                    privilege_emoji = get_user_privilege_emoji(users[bid])
+                    kb.append([InlineKeyboardButton(f"✅ {privilege_emoji} {users[bid]['nickname']}",
+                                                    callback_data=f"unban_{bid}")])
+            kb.append([InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")])
+            await q.edit_message_text("Выбери пользователя для разбана:", reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+        elif data.startswith("unban_") and uid in MODERATORS:
+            bid = int(data.split("_")[1])
+            if bid in banned_users:
+                del banned_users[bid]
+                execute_update("DELETE FROM bans WHERE user_id = %s", (bid,))
+                await q.edit_message_text("✅ Пользователь разбанен", reply_markup=get_moderator_keyboard())
+            return ConversationHandler.END
+
+        elif data == "mod_ban_list" and uid in MODERATORS:
+            if not banned_users:
+                await q.edit_message_text("✅ Нет забаненных пользователей", reply_markup=get_moderator_keyboard())
+                return ConversationHandler.END
+            text = "📋 Список забаненных:\n"
+            for bid, bd in banned_users.items():
+                if bid in users:
+                    privilege_emoji = get_user_privilege_emoji(users[bid])
+                    text += f"\n• {privilege_emoji} {users[bid]['nickname']}: {bd['reason']} ({bd['date'].strftime('%d.%m.%Y')})"
+            await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Назад", callback_data="moderator_panel")]]))
+            return ConversationHandler.END
+
+        elif data == "mod_reset_cd" and uid in MODERATORS:
+            await q.edit_message_text("🔄 Введи @username для сброса КД:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_RESET_CD_USER
+
+        elif data == "mod_force_retire" and uid in MODERATORS:
+            await q.edit_message_text("⚡ Введи @username для сброса КД на возвращение карьеры:",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_RETIRE_COMMENT
+
+        elif data == "mod_give_privilege" and uid in MODERATORS:
+            await q.edit_message_text("👑 Введи @username и привилегию (player/vip/owner) через пробел:",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Отмена", callback_data="moderator_panel")]]))
+            return WAITING_FOR_PRIVILEGE_USER
+
+        elif data == "back_to_main":
+            await q.edit_message_text("Главное меню:", reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+        elif data == "suggest_idea":
+            await q.edit_message_text(
+                "💡 Напиши свою идею или предложение по улучшению бота:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]])
+            )
+            return WAITING_FOR_IDEA_TEXT
+
+        return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка в button_handler: {e}", exc_info=True)
         await q.edit_message_text("⚠️ Произошла ошибка. Попробуйте позже.")
         return ConversationHandler.END
 
-# --- Обработчики текстовых сообщений (примеры с сохранением в БД) ---
+# --- Текстовые обработчики ---
 async def handle_free_agent_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private_chat(update):
         await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
@@ -1145,7 +1270,6 @@ async def handle_free_agent_comment(update: Update, context: ContextTypes.DEFAUL
     post = f"<b>📢 Свободный агент:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Ищет клуб.\nКомментарий: {comment}"
     post = truncate_text(post)
 
-    # Устанавливаем глобальный КД
     execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
     users[uid]["last_request_time"] = datetime.now()
 
@@ -1154,33 +1278,781 @@ async def handle_free_agent_comment(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 async def handle_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... аналогично с UPDATE last_request_time и last_custom_text_date после одобрения
-    pass
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    update_username(uid, update.effective_user.username or "no_username")
+    if users[uid].get("retired"):
+        await update.message.reply_text("❌ Вы завершили карьеру.", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    ok_req, msg_req = check_request_cooldown(uid)
+    if not ok_req:
+        await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    text = escape_html(update.message.text)
+    privilege = format_privilege_for_post(users[uid])
+    post = f"<b>📝 Свой текст:</b>\n\n{privilege} <b>{users[uid]['nickname']}</b>\n{text}"
+    post = truncate_text(post)
+
+    execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
+    users[uid]["last_request_time"] = datetime.now()
+
+    await send_to_moderation(update, context, post, "custom", uid)
+    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
 
 async def handle_new_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... после одобрения модератором выполняется UPDATE users SET nickname=..., last_nickname_change_date=...
-    pass
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    update_username(uid, update.effective_user.username or "no_username")
+    if users[uid].get("retired"):
+        await update.message.reply_text("❌ Вы завершили карьеру. Смена ника недоступна.", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
 
-# --- Функция отправки на модерацию (сохраняет в pending_posts) ---
+    ok_req, msg_req = check_request_cooldown(uid)
+    if not ok_req:
+        await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    new_nickname = update.message.text.strip()
+    is_valid, error_message = is_valid_nickname(new_nickname)
+    if not is_valid:
+        await update.message.reply_text(f"{error_message}\nПопробуй еще раз:", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+        return WAITING_FOR_NEW_NICKNAME
+    if is_nickname_taken(new_nickname, uid):
+        await update.message.reply_text("❌ Этот ник уже занят другим игроком\nПопробуй другой ник:",
+                                        reply_markup=InlineKeyboardMarkup(
+                                            [[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+        return WAITING_FOR_NEW_NICKNAME
+
+    old_nickname = users[uid]['nickname']
+    privilege = format_privilege_for_post(users[uid])
+    post = f"<b>❗️ Смена никнейма в тм:</b>\n\n🔘 {privilege} @{users[uid]['username']} — <b>{old_nickname}</b> ➡️ <b>{new_nickname}</b>"
+    post = truncate_text(post)
+
+    execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
+    users[uid]["last_request_time"] = datetime.now()
+
+    await send_to_moderation(update, context, post, "nickname_change", uid,
+                             {"new_nickname": new_nickname, "old_nickname": old_nickname})
+    await update.message.reply_text("✅ Заявка на смену никнейма отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
+
+async def handle_retire_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid in users:
+        update_username(uid, update.effective_user.username or "no_username")
+    # Если модератор сбрасывает КД возврата
+    if uid in MODERATORS and context.user_data.get("force_retire"):
+        username = update.message.text.strip().replace('@', '')
+        target_id = find_user_by_username(username)
+        if target_id:
+            execute_update("UPDATE users SET retire_date = NULL WHERE user_id = %s", (target_id,))
+            if target_id in users:
+                users[target_id]["retire_date"] = None
+            await update.message.reply_text(f"✅ КД на возвращение карьеры сброшен для @{username}",
+                                            reply_markup=get_moderator_keyboard())
+        else:
+            await update.message.reply_text("❌ Игрок не найден", reply_markup=get_moderator_keyboard())
+        context.user_data["force_retire"] = False
+        return ConversationHandler.END
+
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    if users[uid].get("retired"):
+        await update.message.reply_text("❌ Ты уже завершил карьеру", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    ok_req, msg_req = check_request_cooldown(uid)
+    if not ok_req:
+        await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    comment = escape_html(update.message.text)
+    privilege = format_privilege_for_post(users[uid])
+    post = f"<b>🥀 Завершение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Завершает.\nКомментарий: {comment}"
+    post = truncate_text(post)
+
+    execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
+    users[uid]["last_request_time"] = datetime.now()
+
+    await send_to_moderation(update, context, post, "retire", uid)
+    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
+
+async def handle_resume_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    update_username(uid, update.effective_user.username or "no_username")
+    if not users[uid].get("retired"):
+        await update.message.reply_text("❌ Ты не завершал карьеру", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    ok_req, msg_req = check_request_cooldown(uid)
+    if not ok_req:
+        await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    comment = escape_html(update.message.text)
+    privilege = format_privilege_for_post(users[uid])
+    post = f"<b>🌹 Возвращение карьеры в тм:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) — Возвращается.\nКомментарий: {comment}"
+    post = truncate_text(post)
+
+    execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
+    users[uid]["last_request_time"] = datetime.now()
+
+    await send_to_moderation(update, context, post, "resume", uid)
+    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
+
+async def handle_transfer_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    update_username(uid, update.effective_user.username or "no_username")
+    if users[uid].get("retired"):
+        await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if uid not in TEAM_OWNERS:
+        await update.message.reply_text("❌ У вас нет прав владельца клуба")
+        return ConversationHandler.END
+
+    nickname = update.message.text.strip()
+    club = context.user_data.get("transfer_club")
+    if not club:
+        await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if clubs_data[club]["status"] == "closed":
+        await update.message.reply_text("❌ Ваш клуб закрыт. Трансферы недоступны.", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
+        await update.message.reply_text(f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).",
+                                        reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    is_valid, error_message = is_valid_nickname(nickname)
+    if not is_valid:
+        await update.message.reply_text(f"{error_message}\nПопробуй еще раз:",
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+        return WAITING_FOR_TRANSFER_NICKNAME
+
+    target_id = find_user_by_nickname(nickname)
+    if not target_id:
+        await update.message.reply_text(f"❌ Игрок с ником '{nickname}' не найден\nПроверь правильность написания или попробуй другой ник:",
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")]]))
+        return WAITING_FOR_TRANSFER_NICKNAME
+    if is_banned(target_id):
+        await update.message.reply_text("❌ Этот игрок забанен и не может участвовать в трансферах", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if users[target_id].get("retired"):
+        await update.message.reply_text(f"❌ Игрок {users[target_id]['nickname']} завершил карьеру и не может участвовать в трансферах",
+                                        reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if target_id in clubs_data[club]["players"]:
+        await update.message.reply_text(f"❌ Игрок {users[target_id]['nickname']} уже в вашем клубе", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    if not users[target_id].get("free_agent"):
+        current_club = users[target_id].get("club")
+        if current_club:
+            await update.message.reply_text(f"❌ Игрок {users[target_id]['nickname']} уже в клубе {current_club}.\n"
+                                            f"Предложение о трансфере можно отправить только свободному агенту.",
+                                            reply_markup=get_main_keyboard(uid))
+            return ConversationHandler.END
+
+    ok, msg = check_cooldown(target_id, club)
+    if not ok:
+        await update.message.reply_text(f"❌ У игрока ещё КД {msg}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    rows = execute_query("""
+        INSERT INTO pending_transfers (owner_id, owner_club, target_id, status)
+        VALUES (%s, %s, %s, 'pending') RETURNING transfer_id
+    """, (uid, club, target_id), fetch=True)
+    transfer_id = rows[0]['transfer_id']
+    pending_transfers[transfer_id] = {
+        "owner_id": uid,
+        "owner_club": club,
+        "target_id": target_id,
+        "status": "pending"
+    }
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Принять", callback_data=f"accept_transfer_{transfer_id}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_transfer_{transfer_id}")]
+    ]
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"📢 Вам предложили трансфер в клуб {club}!\n\n"
+            f"От: {users[uid]['nickname']}\n"
+            f"Клуб: {club}\n\n"
+            f"Хотите присоединиться?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        await update.message.reply_text(
+            f"✅ Запрос на трансфер отправлен игроку {users[target_id]['nickname']}. Ожидайте ответа.",
+            reply_markup=get_main_keyboard(uid)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось отправить запрос игроку: {e}", reply_markup=get_main_keyboard(uid))
+        execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+        del pending_transfers[transfer_id]
+    return ConversationHandler.END
+
+async def handle_transfer_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid in users:
+        update_username(uid, update.effective_user.username or "no_username")
+    if users[uid].get("retired"):
+        await update.message.reply_text("❌ Вы завершили карьеру. Трансферы недоступны.", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    transfer_id = context.user_data.get("transfer_id")
+    if not transfer_id or transfer_id not in pending_transfers:
+        await update.message.reply_text("❌ Ошибка, начни заново", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+    transfer = pending_transfers[transfer_id]
+    if transfer["target_id"] != uid:
+        await update.message.reply_text("❌ Это не ваш запрос", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    ok_req, msg_req = check_request_cooldown(uid)
+    if not ok_req:
+        await update.message.reply_text(f"❌ Слишком частые заявки!\n{msg_req}", reply_markup=get_main_keyboard(uid))
+        return ConversationHandler.END
+
+    comment = escape_html(update.message.text)
+    privilege = format_privilege_for_post(users[uid])
+    post = f"<b>📢 Трансфер в клуб:</b>\n\n🔘 {privilege} <b>{users[uid]['nickname']}</b> (@{users[uid]['username']}) ➡️ {transfer['owner_club']}\nКомментарий: {comment}"
+    post = truncate_text(post)
+
+    execute_update("UPDATE users SET last_request_time = %s WHERE user_id = %s", (datetime.now(), uid))
+    users[uid]["last_request_time"] = datetime.now()
+
+    await send_to_moderation(update, context, post, "transfer", uid, {
+        "target": uid,
+        "club": transfer['owner_club'],
+        "owner_id": transfer['owner_id']
+    })
+
+    try:
+        await context.bot.send_message(
+            transfer['owner_id'],
+            f"✅ Игрок {users[uid]['nickname']} принял предложение о трансфере в {transfer['owner_club']}!\n"
+            f"Заявка отправлена на модерацию."
+        )
+    except:
+        pass
+
+    del pending_transfers[transfer_id]
+    execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+    context.user_data["transfer_id"] = None
+    await update.message.reply_text("✅ Заявка отправлена на модерацию!", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
+
+async def handle_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in MODERATORS:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    parts = text.split(" ", 1)
+    if len(parts) < 2:
+        await update.message.reply_text("❌ Формат: @username причина")
+        return ConversationHandler.END
+    username, reason = parts[0], parts[1]
+    target_id = find_user_by_username(username.replace('@', ''))
+    if not target_id:
+        await update.message.reply_text("❌ Игрок не найден")
+        return ConversationHandler.END
+    now = datetime.now()
+    execute_update("INSERT INTO bans (user_id, reason, ban_date) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason, ban_date = EXCLUDED.ban_date",
+                   (target_id, reason, now))
+    banned_users[target_id] = {"reason": reason, "date": now}
+    await update.message.reply_text(f"✅ {username} забанен")
+    return ConversationHandler.END
+
+async def handle_reset_cd_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in MODERATORS:
+        return ConversationHandler.END
+    username = update.message.text.strip().replace('@', '')
+    target_id = find_user_by_username(username)
+    if not target_id:
+        await update.message.reply_text("❌ Игрок не найден", reply_markup=get_moderator_keyboard())
+        return ConversationHandler.END
+    execute_update("DELETE FROM transfer_cooldowns WHERE user_id = %s", (target_id,))
+    execute_update("""
+        UPDATE users SET
+            last_free_agent_date = NULL,
+            last_custom_text_date = NULL,
+            retire_date = NULL,
+            last_nickname_change_date = NULL,
+            last_request_time = NULL
+        WHERE user_id = %s
+    """, (target_id,))
+    for club in clubs_data:
+        if target_id in clubs_data[club]["transfer_cooldowns"]:
+            del clubs_data[club]["transfer_cooldowns"][target_id]
+    if target_id in users:
+        users[target_id]["last_free_agent_date"] = None
+        users[target_id]["last_custom_text_date"] = None
+        users[target_id]["retire_date"] = None
+        users[target_id]["last_nickname_change_date"] = None
+        users[target_id]["last_request_time"] = None
+    await update.message.reply_text(f"✅ КД сброшены для @{username}", reply_markup=get_moderator_keyboard())
+    return ConversationHandler.END
+
+async def handle_privilege_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in MODERATORS:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    parts = text.split(" ", 1)
+    if len(parts) < 2:
+        await update.message.reply_text("❌ Формат: @username player/vip/owner")
+        return ConversationHandler.END
+    username = parts[0].replace('@', '')
+    privilege = parts[1].lower()
+    if privilege not in ["player", "vip", "owner"]:
+        await update.message.reply_text("❌ Доступные привилегии: player, vip, owner")
+        return ConversationHandler.END
+    target_id = find_user_by_username(username)
+    if not target_id:
+        await update.message.reply_text("❌ Игрок не найден")
+        return ConversationHandler.END
+    execute_update("UPDATE users SET privilege = %s WHERE user_id = %s", (privilege, target_id))
+    if target_id in users:
+        users[target_id]["privilege"] = privilege
+    privilege_text = PRIVILEGES.get(privilege, "[Игрок]")
+    await update.message.reply_text(f"✅ Игроку @{username} выдана привилегия {privilege_text}!",
+                                    reply_markup=get_moderator_keyboard())
+    try:
+        await context.bot.send_message(target_id, f"🎉 Вам выдана привилегия {privilege_text}!")
+    except:
+        pass
+    return ConversationHandler.END
+
+async def handle_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in MODERATORS:
+        return ConversationHandler.END
+    reason = update.message.text.strip()
+    post_id = context.user_data.get("reject_post_id")
+    if not post_id or post_id not in pending_posts:
+        await update.message.reply_text("❌ Заявка уже обработана", reply_markup=get_moderator_keyboard())
+        return ConversationHandler.END
+    post = pending_posts[post_id]
+    try:
+        await context.bot.send_message(post["author_id"], f"❌ Ваша заявка отклонена\nПричина: {reason}")
+    except:
+        pass
+    execute_update("DELETE FROM pending_posts WHERE post_id = %s", (post_id,))
+    del pending_posts[post_id]
+    del context.user_data["reject_post_id"]
+    await update.message.reply_text(f"✅ Заявка #{post_id} отклонена с причиной", reply_markup=get_moderator_keyboard())
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in users:
+        await update.message.reply_text("❌ Действие отменено", reply_markup=get_main_keyboard(uid))
+    else:
+        await update.message.reply_text("❌ Действие отменено")
+    return ConversationHandler.END
+
+async def handle_idea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Это действие доступно только в личных сообщениях.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Зарегистрируйся через /start")
+        return ConversationHandler.END
+    update_username(uid, update.effective_user.username or "no_username")
+    idea_text = escape_html(update.message.text)
+    user_info = f"{get_user_privilege_text(users[uid])} {users[uid]['nickname']} (@{users[uid]['username']})"
+    post = f"<b>💡 Предложение от пользователя</b>\n\n{user_info}\n\nТекст идеи:\n{idea_text}"
+    post = truncate_text(post)
+    try:
+        await context.bot.send_message(MODERATION_CHAT_ID, post, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Ошибка отправки идеи в модерацию: {e}")
+    await update.message.reply_text("✅ Спасибо за идею! Мы рассмотрим её в ближайшее время.", reply_markup=get_main_keyboard(uid))
+    return ConversationHandler.END
+
+# ==================== КОМАНДЫ ====================
+async def close_my_club(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await update.message.reply_text("🤖 Эта команда доступна только в личных сообщениях.")
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    if user_id not in TEAM_OWNERS:
+        await update.message.reply_text("❌ У вас нет клуба для закрытия")
+        return ConversationHandler.END
+    club_name = TEAM_OWNERS[user_id]
+    if clubs_data[club_name]["status"] == "closed":
+        await update.message.reply_text(f"❌ Клуб {club_name} уже закрыт")
+        return ConversationHandler.END
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, закрыть", callback_data=f"confirm_close_club_{club_name}"),
+         InlineKeyboardButton("❌ Нет, отмена", callback_data="back_to_main")]
+    ]
+    await update.message.reply_text(
+        f"⚠️ Вы уверены, что хотите **закрыть клуб {club_name}**?\n\n"
+        f"После закрытия:\n"
+        f"• Вы потеряете права владельца клуба\n"
+        f"• Все игроки клуба станут свободными агентами\n"
+        f"• Кнопки трансфера исчезнут\n"
+        f"• Только модератор сможет назначить нового владельца",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_FOR_CLUB_CLOSE_CONFIRM
+
+async def transfer_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ У вас нет прав модератора")
+        return ConversationHandler.END
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: /transfer_player ID_игрока Название_клуба")
+        return ConversationHandler.END
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return ConversationHandler.END
+    club_name = " ".join(context.args[1:]).strip('"')
+    if club_name not in CLUBS:
+        await update.message.reply_text(f"❌ Клуб '{club_name}' не найден")
+        return ConversationHandler.END
+    if clubs_data[club_name]["status"] == "closed":
+        await update.message.reply_text(f"❌ Клуб '{club_name}' закрыт.")
+        return ConversationHandler.END
+    if len(clubs_data[club_name]["players"]) >= MAX_CLUB_MEMBERS:
+        await update.message.reply_text(f"❌ В клубе '{club_name}' уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).")
+        return ConversationHandler.END
+    if target_id not in users:
+        await update.message.reply_text(f"❌ Игрок с ID {target_id} не найден.")
+        return ConversationHandler.END
+    if is_banned(target_id) or users[target_id].get("retired"):
+        await update.message.reply_text(f"❌ Игрок не может быть переведен (бан или завершил карьеру).")
+        return ConversationHandler.END
+
+    old_club = users[target_id].get("club")
+    if old_club:
+        execute_update("DELETE FROM club_players WHERE club_name = %s AND user_id = %s", (old_club, target_id))
+        if target_id in clubs_data[old_club]["players"]:
+            clubs_data[old_club]["players"].remove(target_id)
+    execute_update("UPDATE users SET club = %s, free_agent = FALSE WHERE user_id = %s", (club_name, target_id))
+    execute_update("INSERT INTO club_players (club_name, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (club_name, target_id))
+    users[target_id]["club"] = club_name
+    users[target_id]["free_agent"] = False
+    if target_id not in clubs_data[club_name]["players"]:
+        clubs_data[club_name]["players"].append(target_id)
+
+    await update.message.reply_text(f"✅ Игрок с ID {target_id} успешно переведен в клуб {club_name}!")
+    try:
+        await context.bot.send_message(target_id, f"Вы были переведены модератором в клуб {club_name}!")
+    except:
+        pass
+    return ConversationHandler.END
+
+async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in users:
+        await update.message.reply_text("❌ Вы не зарегистрированы.")
+        return
+    if uid not in TEAM_OWNERS:
+        await update.message.reply_text("❌ Вы не являетесь владельцем клуба.")
+        return
+    club = TEAM_OWNERS[uid]
+    if clubs_data[club]["status"] == "closed":
+        await update.message.reply_text("❌ Ваш клуб закрыт. Трансферы недоступны.")
+        return
+    if len(clubs_data[club]["players"]) >= MAX_CLUB_MEMBERS:
+        await update.message.reply_text(f"❌ В вашем клубе уже максимальное количество игроков ({MAX_CLUB_MEMBERS}).")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /transfer <ник игрока>")
+        return
+    nickname = " ".join(context.args).strip()
+    target_id = find_user_by_nickname(nickname)
+    if not target_id:
+        await update.message.reply_text(f"❌ Игрок с ником '{nickname}' не найден.")
+        return
+    if target_id == uid:
+        await update.message.reply_text("❌ Вы не можете отправить трансфер самому себе.")
+        return
+    if is_banned(target_id) or users[target_id].get("retired"):
+        await update.message.reply_text("❌ Этот игрок не может участвовать в трансферах.")
+        return
+    if target_id in clubs_data[club]["players"]:
+        await update.message.reply_text(f"❌ Игрок {users[target_id]['nickname']} уже в вашем клубе.")
+        return
+    if not users[target_id].get("free_agent"):
+        current_club = users[target_id].get("club")
+        if current_club:
+            await update.message.reply_text(f"❌ Игрок {users[target_id]['nickname']} уже в клубе {current_club}.")
+            return
+    ok, msg = check_cooldown(target_id, club)
+    if not ok:
+        await update.message.reply_text(f"❌ У игрока ещё КД {msg}")
+        return
+    rows = execute_query("""
+        INSERT INTO pending_transfers (owner_id, owner_club, target_id, status)
+        VALUES (%s, %s, %s, 'pending') RETURNING transfer_id
+    """, (uid, club, target_id), fetch=True)
+    transfer_id = rows[0]['transfer_id']
+    pending_transfers[transfer_id] = {"owner_id": uid, "owner_club": club, "target_id": target_id, "status": "pending"}
+    keyboard = [[InlineKeyboardButton("✅ Принять", callback_data=f"accept_transfer_{transfer_id}"),
+                 InlineKeyboardButton("❌ Отклонить", callback_data=f"decline_transfer_{transfer_id}")]]
+    try:
+        await context.bot.send_message(target_id, f"📢 Вам предложили трансфер в клуб {club}!\n\nОт: {users[uid]['nickname']}\nКлуб: {club}\n\nХотите присоединиться?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(f"✅ Запрос на трансфер отправлен игроку {users[target_id]['nickname']}.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось отправить запрос игроку: {e}")
+        execute_update("DELETE FROM pending_transfers WHERE transfer_id = %s", (transfer_id,))
+        del pending_transfers[transfer_id]
+
+async def club_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args:
+        club_name = " ".join(args).strip('"')
+        if club_name in clubs_data:
+            text = await format_club_profile(club_name, clubs_data[club_name])
+            await update.message.reply_text(text, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ Клуб '{club_name}' не найден.")
+    else:
+        uid = update.effective_user.id
+        if uid in users:
+            club = users[uid].get("club")
+            if club:
+                text = await format_club_profile(club, clubs_data[club])
+                await update.message.reply_text(text, parse_mode='Markdown')
+            else:
+                await update.message.reply_text("❌ Вы не состоите в клубе.")
+        else:
+            await update.message.reply_text("❌ Вы не зарегистрированы.")
+
+async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args:
+        query = " ".join(args).strip()
+        target_id = find_user_by_nickname(query) or find_user_by_username(query.replace('@', ''))
+        if target_id and target_id in users:
+            text = format_player_info(users[target_id], target_id)
+            await update.message.reply_text(text, parse_mode='MarkdownV2')
+        else:
+            await update.message.reply_text(f"❌ Игрок с ником или username '{query}' не найден.")
+    else:
+        uid = update.effective_user.id
+        if uid in users:
+            text = format_player_info(users[uid], uid)
+            await update.message.reply_text(text, parse_mode='MarkdownV2')
+        else:
+            await update.message.reply_text("❌ Вы не зарегистрированы.")
+
+async def reset_cds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ Нет прав")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /reset_cds ID_игрока")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    if target_id not in users:
+        await update.message.reply_text("❌ Игрок с таким ID не найден")
+        return
+    execute_update("DELETE FROM transfer_cooldowns WHERE user_id = %s", (target_id,))
+    execute_update("""
+        UPDATE users SET
+            last_free_agent_date = NULL,
+            last_custom_text_date = NULL,
+            retire_date = NULL,
+            last_nickname_change_date = NULL,
+            last_request_time = NULL
+        WHERE user_id = %s
+    """, (target_id,))
+    for club in clubs_data:
+        if target_id in clubs_data[club]["transfer_cooldowns"]:
+            del clubs_data[club]["transfer_cooldowns"][target_id]
+    if target_id in users:
+        users[target_id]["last_free_agent_date"] = None
+        users[target_id]["last_custom_text_date"] = None
+        users[target_id]["retire_date"] = None
+        users[target_id]["last_nickname_change_date"] = None
+        users[target_id]["last_request_time"] = None
+    await update.message.reply_text(f"✅ Все КД сброшены для игрока с ID {target_id}")
+
+async def force_retire(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ Нет прав")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /force_retire ID_игрока")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    if target_id not in users:
+        await update.message.reply_text("❌ Игрок с таким ID не найден")
+        return
+    execute_update("UPDATE users SET retire_date = NULL WHERE user_id = %s", (target_id,))
+    users[target_id]["retire_date"] = None
+    await update.message.reply_text(f"✅ КД на возвращение карьеры сброшен для игрока с ID {target_id}")
+
+async def give_privilege(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ Нет прав")
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: /give_privilege ID_игрока player/vip/owner")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    privilege = context.args[1].lower()
+    if privilege not in ["player", "vip", "owner"]:
+        await update.message.reply_text("❌ Доступные привилегии: player, vip, owner")
+        return
+    if target_id not in users:
+        await update.message.reply_text("❌ Игрок с таким ID не найден")
+        return
+    execute_update("UPDATE users SET privilege = %s WHERE user_id = %s", (privilege, target_id))
+    users[target_id]["privilege"] = privilege
+    privilege_text = PRIVILEGES.get(privilege, "[Игрок]")
+    await update.message.reply_text(f"✅ Игроку с ID {target_id} выдана привилегия {privilege_text}!")
+    try:
+        await context.bot.send_message(target_id, f"🎉 Вам выдана привилегия {privilege_text}!")
+    except:
+        pass
+
+async def close_club_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ У вас нет прав модератора")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: /close_club ID_владельца")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    if target_id not in users or target_id not in TEAM_OWNERS:
+        await update.message.reply_text(f"❌ Пользователь с ID {target_id} не является владельцем клуба")
+        return
+    club_name = TEAM_OWNERS[target_id]
+    if clubs_data[club_name]["status"] == "closed":
+        await update.message.reply_text(f"❌ Клуб {club_name} уже закрыт")
+        return
+    players_in_club = clubs_data[club_name]["players"].copy()
+    execute_update("UPDATE clubs SET status = 'closed', closed_date = %s, owner_id = NULL WHERE name = %s",
+                   (datetime.now(), club_name))
+    for pid in players_in_club:
+        execute_update("UPDATE users SET club = NULL, free_agent = TRUE WHERE user_id = %s", (pid,))
+    execute_update("DELETE FROM club_players WHERE club_name = %s", (club_name,))
+    if target_id in TEAM_OWNERS:
+        del TEAM_OWNERS[target_id]
+    clubs_data[club_name]["status"] = "closed"
+    clubs_data[club_name]["closed_date"] = datetime.now()
+    clubs_data[club_name]["owner_id"] = None
+    clubs_data[club_name]["players"] = []
+    for pid in players_in_club:
+        if pid in users:
+            users[pid]["club"] = None
+            users[pid]["free_agent"] = True
+    await update.message.reply_text(
+        f"✅ Клуб {club_name} успешно закрыт модератором!\n"
+        f"Владелец с ID {target_id} больше не имеет прав на клуб.\n"
+        f"Все игроки ({len(players_in_club)}) стали свободными агентами."
+    )
+
+async def set_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in MODERATORS:
+        await update.message.reply_text("❌ Нет прав")
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("❌ Использование: /set_owner ID_пользователя Название_клуба")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    club_name = " ".join(context.args[1:]).strip('"')
+    if club_name not in CLUBS:
+        await update.message.reply_text("❌ Клуб не найден")
+        return
+    if target_id not in users:
+        await update.message.reply_text(f"❌ Пользователь с ID {target_id} не найден")
+        return
+    old_owner_id = clubs_data[club_name]["owner_id"]
+    if old_owner_id and old_owner_id in TEAM_OWNERS:
+        del TEAM_OWNERS[old_owner_id]
+    execute_update("UPDATE clubs SET owner_id = %s, status = 'active', closed_date = NULL WHERE name = %s",
+                   (target_id, club_name))
+    TEAM_OWNERS[target_id] = club_name
+    clubs_data[club_name]["owner_id"] = target_id
+    clubs_data[club_name]["status"] = "active"
+    clubs_data[club_name]["closed_date"] = None
+    await update.message.reply_text("✅ Владелец назначен!")
+
+# ==================== МОДЕРАЦИЯ ====================
 async def send_to_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, post_type: str,
                              author_id: int, extra_data: dict = None):
-    # Вставляем в БД и получаем post_id
     extra_json = psycopg2.extras.Json(extra_data) if extra_data else None
     rows = execute_query("""
         INSERT INTO pending_posts (author_id, post_type, text, extra_data)
         VALUES (%s, %s, %s, %s) RETURNING post_id
     """, (author_id, post_type, text, extra_json), fetch=True)
-    post_id = rows[0]['post_id'] if rows else len(pending_posts)+1
-    # Сохраняем в кэш
+    post_id = rows[0]['post_id']
     pending_posts[post_id] = {"text": text, "type": post_type, "author_id": author_id, "extra_data": extra_data or {}}
-
     keyboard = [[InlineKeyboardButton("✅ Принять", callback_data=f"approve_{post_id}"),
                  InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{post_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(MODERATION_CHAT_ID, f"🔔 Новая заявка #{post_id}\n\n{text}",
                                    reply_markup=reply_markup, parse_mode='HTML')
 
-# --- Модерация: одобрение (обновлено) ---
 async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1193,17 +2065,12 @@ async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("❌ Заявка уже обработана")
         return
     post = pending_posts[post_id]
-
     try:
-        # Публикация в канал
         await context.bot.send_message(CHANNEL_ID, post["text"], parse_mode='HTML')
-
-        # Применяем изменения в БД в зависимости от типа
         author_id = post["author_id"]
         if post["type"] == "free_agent":
             execute_update("UPDATE users SET last_free_agent_date = %s WHERE user_id = %s", (datetime.now(), author_id))
             users[author_id]["last_free_agent_date"] = datetime.now()
-            # Делаем свободным агентом
             old_club = users[author_id].get("club")
             if old_club:
                 execute_update("DELETE FROM club_players WHERE club_name = %s AND user_id = %s", (old_club, author_id))
@@ -1222,22 +2089,57 @@ async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE)
             users[author_id]["nickname"] = new_nickname
             users[author_id]["last_nickname_change_date"] = datetime.now()
         elif post["type"] == "retire":
-            # Логика завершения карьеры (включая закрытие клуба, если владелец)
-            # ... (реализуется аналогично с обновлением БД)
-            pass
+            execute_update("UPDATE users SET retired = TRUE, retire_date = %s WHERE user_id = %s", (datetime.now(), author_id))
+            users[author_id]["retired"] = True
+            users[author_id]["retire_date"] = datetime.now()
+            if author_id in TEAM_OWNERS:
+                club_name = TEAM_OWNERS[author_id]
+                players_in_club = clubs_data[club_name]["players"].copy()
+                execute_update("UPDATE clubs SET status = 'closed', closed_date = %s, owner_id = NULL WHERE name = %s",
+                               (datetime.now(), club_name))
+                for pid in players_in_club:
+                    execute_update("UPDATE users SET club = NULL, free_agent = TRUE WHERE user_id = %s", (pid,))
+                execute_update("DELETE FROM club_players WHERE club_name = %s", (club_name,))
+                del TEAM_OWNERS[author_id]
+                clubs_data[club_name]["status"] = "closed"
+                clubs_data[club_name]["closed_date"] = datetime.now()
+                clubs_data[club_name]["owner_id"] = None
+                clubs_data[club_name]["players"] = []
+                for pid in players_in_club:
+                    if pid in users:
+                        users[pid]["club"] = None
+                        users[pid]["free_agent"] = True
+                    try:
+                        await context.bot.send_message(pid, f"🔴 Клуб **{club_name}** был закрыт, так как его владелец завершил карьеру.\nТеперь вы свободный агент.", parse_mode='Markdown')
+                    except:
+                        pass
         elif post["type"] == "resume":
             execute_update("UPDATE users SET retired = FALSE WHERE user_id = %s", (author_id,))
             users[author_id]["retired"] = False
         elif post["type"] == "transfer":
             target = post["extra_data"].get("target")
             club = post["extra_data"].get("club")
-            # ... (обновление БД)
-            pass
-
-        # Удаляем заявку из БД и кэша
+            if target and club:
+                old_club = users[target].get("club")
+                if old_club:
+                    execute_update("DELETE FROM club_players WHERE club_name = %s AND user_id = %s", (old_club, target))
+                    if target in clubs_data[old_club]["players"]:
+                        clubs_data[old_club]["players"].remove(target)
+                execute_update("UPDATE users SET club = %s, free_agent = FALSE WHERE user_id = %s", (club, target))
+                execute_update("INSERT INTO club_players (club_name, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (club, target))
+                execute_update("INSERT INTO transfer_cooldowns (club_name, user_id, cooldown_date) VALUES (%s, %s, %s) ON CONFLICT (club_name, user_id) DO UPDATE SET cooldown_date = EXCLUDED.cooldown_date",
+                               (club, target, datetime.now()))
+                users[target]["club"] = club
+                users[target]["free_agent"] = False
+                if target not in clubs_data[club]["players"]:
+                    clubs_data[club]["players"].append(target)
+                clubs_data[club]["transfer_cooldowns"][target] = datetime.now()
+                try:
+                    await context.bot.send_message(post["extra_data"]["owner_id"], f"✅ Трансфер игрока {users[target]['nickname']} в {club} одобрен!")
+                except:
+                    pass
         execute_update("DELETE FROM pending_posts WHERE post_id = %s", (post_id,))
         del pending_posts[post_id]
-
         await query.edit_message_text(f"✅ Заявка #{post_id} опубликована!")
         try:
             await context.bot.send_message(author_id, "✅ Ваша заявка опубликована!")
@@ -1249,20 +2151,13 @@ async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ==================== MAIN ====================
 def main():
-    # Инициализация логгера
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-    global logger
-    logger = logging.getLogger(__name__)
-
-    # Подготовка БД
     init_postgres()
-    migrate_from_json()   # однократный перенос из JSON, если файл есть
-    load_data_to_cache()  # загрузка в глобальные переменные
+    migrate_from_json()
+    load_data_to_cache()
 
     print("✅ Бот запускается...")
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ConversationHandler (сокращён для экономии места, но полный аналог предыдущей версии)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
