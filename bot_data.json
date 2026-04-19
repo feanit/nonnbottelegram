@@ -5770,5 +5770,5 @@
       "status": "pending"
     }
   }
-  "$schema": "https://railway.com/railway.schema.json"
+  "$schema": "https://railway.com/railway.bot_data.json"
 }
