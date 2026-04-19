@@ -7,6 +7,10 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 
+# Новый импорт для PostgreSQL
+import psycopg2
+from psycopg2 import sql
+
 # Проверка версии Python
 if sys.version_info >= (3, 12):
     print("⚠️ Внимание: Вы используете Python 3.12+. Если возникнут проблемы, установите Python 3.11")
@@ -293,6 +297,110 @@ def load_data():
                     f"{len(pending_posts)} заявок, {len(pending_transfers)} трансферов")
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки: {e}")
+
+
+def init_postgres():
+    """Создаёт таблицы в PostgreSQL, если их ещё нет."""
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        logger.warning("⚠️ DATABASE_URL не найден, пропускаем инициализацию PostgreSQL")
+        return
+
+    # psycopg2 требует postgresql:// вместо postgres://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+
+    try:
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        # Таблица пользователей
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                nickname TEXT NOT NULL,
+                username TEXT,
+                free_agent BOOLEAN DEFAULT TRUE,
+                club TEXT,
+                retired BOOLEAN DEFAULT FALSE,
+                retire_date TIMESTAMP,
+                last_free_agent_date TIMESTAMP,
+                last_custom_text_date TIMESTAMP,
+                last_nickname_change_date TIMESTAMP,
+                last_request_time TIMESTAMP,
+                privilege TEXT DEFAULT 'player',
+                reg_date TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # Таблица клубов
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clubs (
+                name TEXT PRIMARY KEY,
+                owner_id BIGINT,
+                status TEXT DEFAULT 'active',
+                closed_date TIMESTAMP
+            )
+        """)
+
+        # Таблица игроков в клубах (связь many-to-many)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS club_players (
+                club_name TEXT REFERENCES clubs(name) ON DELETE CASCADE,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                PRIMARY KEY (club_name, user_id)
+            )
+        """)
+
+        # Таблица трансферных кулдаунов
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS transfer_cooldowns (
+                club_name TEXT REFERENCES clubs(name) ON DELETE CASCADE,
+                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                cooldown_date TIMESTAMP NOT NULL,
+                PRIMARY KEY (club_name, user_id)
+            )
+        """)
+
+        # Таблица банов
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bans (
+                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                reason TEXT,
+                ban_date TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # Таблица заявок на модерацию
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_posts (
+                post_id SERIAL PRIMARY KEY,
+                author_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                post_type TEXT,
+                text TEXT,
+                extra_data JSONB,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # Таблица ожидающих трансферов
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_transfers (
+                transfer_id SERIAL PRIMARY KEY,
+                owner_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                owner_club TEXT,
+                target_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        cur.close()
+        conn.close()
+        logger.info("✅ Таблицы PostgreSQL созданы/проверены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации PostgreSQL: {e}")
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -2510,6 +2618,7 @@ async def moderation_approve(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==================== MAIN ====================
 def main():
     load_data()
+    init_postgres()   # <-- инициализация таблиц PostgreSQL
 
     print("✅ Бот запускается...")
     print(f"📢 Токен: {BOT_TOKEN[:10]}...")
