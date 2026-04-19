@@ -1,6 +1,3 @@
-
-  "$schema": "https://railway.com/railway.schema.json"
-
 {
   "users": {
     "8516314184": {
@@ -5773,4 +5770,7 @@
       "status": "pending"
     }
   }
+}
+{
+  "$schema": "https://railway.com/railway.schema.json"
 }
